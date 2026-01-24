@@ -29,7 +29,7 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: |
-          hour=$(TZ=America/New_York date +%H)
+          hour=$(TZ="America/New_York" date +%H)
           if [ "$hour" != "09" ] && [ "$hour" != "17" ]; then
             echo "Not 9am/5pm ET; exiting."
             exit 0

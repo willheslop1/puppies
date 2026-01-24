@@ -2,7 +2,7 @@ name: MSPCA Scraper
 
 on:
   schedule:
-    - cron: "0 13,21 * * *"  # 9am/5pm Eastern = 13:00/21:00 UTC (adjust for DST)
+    - cron: "0 * * * *"  # run hourly; gate by Eastern time below
   workflow_dispatch:
 
 jobs:
@@ -21,7 +21,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 pandas
 
-      - name: Run scraper
+      - name: Run scraper (9am/5pm Eastern only)
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
@@ -29,4 +29,9 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: |
+          hour=$(TZ=America/New_York date +%H)
+          if [ "$hour" != "09" ] && [ "$hour" != "17" ]; then
+            echo "Not 9am/5pm ET; exiting."
+            exit 0
+          fi
           python scrape_mspca_final.py

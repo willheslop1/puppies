@@ -1,0 +1,4 @@
+.vscode/
+cron.out
+cron.err
+mspca_dogs_final.csv

@@ -281,24 +281,10 @@ def scrape_all_dogs(
     return df
 
 
-def _load_prev_hypo_ids(path: str) -> set:
-    if not os.path.exists(path):
-        return set()
-    try:
-        prev = pd.read_csv(path)
-    except Exception:
-        return set()
-    if "detail_url" in prev.columns:
-        prev_ids = prev["detail_url"].fillna("").astype(str)
-        return set(v for v in prev_ids if v)
-    return set()
-
-
 def send_email_with_csv(
     csv_path: str,
     row_count: int,
     hypo_count: int,
-    new_hypo_count: int,
     subject_prefix: str = "MSCPA Dogs",
 ) -> None:
     smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
@@ -322,7 +308,6 @@ def send_email_with_csv(
         f"{row_count} dogs.\n"
         f"Total dogs: {row_count}\n"
         f"Hypoallergenic: {hypo_count}\n"
-        f"New hypoallergenic: {new_hypo_count}\n"
         f"Generated at {now}."
     )
 
@@ -345,18 +330,10 @@ if __name__ == "__main__":
     df = scrape_all_dogs(max_pages=30, sleep_s=1.0, debug=False, show_progress=True)
     print(df.head(10))
     output_path = "mspca_dogs_final.csv"
-    prev_hypo_ids = _load_prev_hypo_ids(output_path)
     df.to_csv(output_path, index=False)
     print(f"Saved {len(df)} dogs to {output_path}")
     hypo_count = int(df["is_hypoallergenic"].sum()) if "is_hypoallergenic" in df.columns else 0
-    new_hypo_count = 0
-    if "detail_url" in df.columns and "is_hypoallergenic" in df.columns:
-        current_hypo_ids = set(
-            df.loc[df["is_hypoallergenic"] == 1, "detail_url"].fillna("").astype(str)
-        )
-        current_hypo_ids = set(v for v in current_hypo_ids if v)
-        new_hypo_count = len(current_hypo_ids - prev_hypo_ids)
-    email_sent = send_email_with_csv(output_path, len(df), hypo_count, new_hypo_count)
+    email_sent = send_email_with_csv(output_path, len(df), hypo_count)
     if email_sent:
         print("Email sent.")
     else:

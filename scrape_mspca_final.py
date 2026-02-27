@@ -17,10 +17,12 @@ Notes:
 - This intentionally does NOT visit individual dog detail pages.
 """
 
-import re
-import time
+import argparse
+import logging
 import os
+import re
 import smtplib
+import time
 from email.message import EmailMessage
 from datetime import datetime
 from dataclasses import dataclass, asdict
@@ -84,6 +86,18 @@ def _progress(page: int, max_pages: int) -> None:
     print(f"\rProgress: [{bar}] page {page}/{max_pages}", end="", flush=True)
 
 
+def _setup_logging(log_path: str, verbose: bool) -> None:
+    handlers = [
+        logging.FileHandler(log_path),
+        logging.StreamHandler(),
+    ]
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=handlers,
+    )
+
+
 @dataclass
 class Dog:
     name: str
@@ -97,10 +111,33 @@ class Dog:
     raw_stats: Dict[str, str]
 
 
-def fetch(url: str) -> str:
-    resp = requests.get(url, headers=HEADERS, timeout=30)
-    resp.raise_for_status()
-    return resp.text
+def fetch(url: str, max_retries: int = 3, backoff_s: float = 1.0) -> str:
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=30)
+            if resp.status_code in (429, 500, 502, 503, 504):
+                raise requests.HTTPError(
+                    f"HTTP {resp.status_code} on {url}", response=resp
+                )
+            resp.raise_for_status()
+            return resp.text
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                sleep_for = backoff_s * (2 ** (attempt - 1))
+                logging.warning(
+                    "fetch failed (attempt %s/%s): %s; retrying in %.1fs",
+                    attempt,
+                    max_retries,
+                    exc,
+                    sleep_for,
+                )
+                time.sleep(sleep_for)
+            else:
+                logging.error("fetch failed (attempt %s/%s): %s", attempt, max_retries, exc)
+                raise
+    raise last_exc
 
 
 def parse_dogs_from_page(html: str, page_url: str, debug: bool = False) -> List[Dog]:
@@ -217,6 +254,8 @@ def scrape_all_dogs(
     debug: bool = False,
     max_zero_new_pages: int = 3,
     show_progress: bool = True,
+    max_retries: int = 3,
+    backoff_s: float = 1.0,
 ) -> pd.DataFrame:
     all_dogs: List[Dog] = []
     seen_urls = set()
@@ -226,7 +265,7 @@ def scrape_all_dogs(
         url = page_url(p)
 
         try:
-            html = fetch(url)
+            html = fetch(url, max_retries=max_retries, backoff_s=backoff_s)
         except requests.HTTPError as exc:
             resp = exc.response
             if resp is not None and resp.status_code == 404:
@@ -240,7 +279,9 @@ def scrape_all_dogs(
             if d.detail_url and d.detail_url not in seen_urls
         }
         if debug:
-            print(f"debug: page={p} new_urls={len(new_urls)} total_seen={len(seen_urls)}")
+            logging.debug(
+                "page=%s new_urls=%s total_seen=%s", p, len(new_urls), len(seen_urls)
+            )
         if show_progress:
             _progress(p, max_pages)
 
@@ -319,22 +360,50 @@ def send_email_with_csv(
             filename=os.path.basename(csv_path),
         )
 
-    with smtplib.SMTP(smtp_host, smtp_port) as server:
-        server.starttls()
-        server.login(smtp_user, smtp_pass)
-        server.send_message(msg)
-    return True
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.send_message(msg)
+        return True
+    except Exception as exc:
+        logging.error("email send failed: %s", exc)
+        return False
 
 
 if __name__ == "__main__":
-    df = scrape_all_dogs(max_pages=30, sleep_s=1.0, debug=False, show_progress=True)
-    print(df.head(10))
-    output_path = "mspca_dogs_final.csv"
+    parser = argparse.ArgumentParser(description="MSPCA dog adoption scraper")
+    parser.add_argument("--max-pages", type=int, default=30)
+    parser.add_argument("--sleep-s", type=float, default=1.0)
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--show-progress", action="store_true")
+    parser.add_argument("--max-zero-new-pages", type=int, default=3)
+    parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--backoff-s", type=float, default=1.0)
+    parser.add_argument("--log-path", default="scrape.log")
+    parser.add_argument("--output-prefix", default="")
+    args = parser.parse_args()
+
+    _setup_logging(args.log_path, verbose=args.debug)
+
+    df = scrape_all_dogs(
+        max_pages=args.max_pages,
+        sleep_s=args.sleep_s,
+        debug=args.debug,
+        show_progress=args.show_progress,
+        max_zero_new_pages=args.max_zero_new_pages,
+        max_retries=args.max_retries,
+        backoff_s=args.backoff_s,
+    )
+    logging.info("scraped %s dogs", len(df))
+    timestamp = datetime.now().strftime("%Y.%m.%d_%H.%M")
+    prefix = args.output_prefix
+    output_path = f"{prefix}{timestamp}_mspca_dogs_final.csv"
     df.to_csv(output_path, index=False)
-    print(f"Saved {len(df)} dogs to {output_path}")
+    logging.info("saved %s dogs to %s", len(df), output_path)
     hypo_count = int(df["is_hypoallergenic"].sum()) if "is_hypoallergenic" in df.columns else 0
     email_sent = send_email_with_csv(output_path, len(df), hypo_count)
     if email_sent:
-        print("Email sent.")
+        logging.info("email sent")
     else:
-        print("Email not sent (missing SMTP_* or EMAIL_TO env vars).")
+        logging.info("email not sent (missing SMTP_* or EMAIL_TO env vars)")

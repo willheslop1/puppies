@@ -2,3 +2,5 @@
 cron.out
 cron.err
 mspca_dogs_final.csv
+*_mspca_dogs_final.csv
+scrape.log

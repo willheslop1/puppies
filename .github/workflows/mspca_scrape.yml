@@ -21,7 +21,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 pandas
 
-      - name: Run scraper (9am/5pm Eastern only)
+      - name: Run scraper
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
@@ -29,9 +29,4 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: |
-          hour=$(TZ="America/New_York" date +%H)
-          if [ "$hour" != "09" ] && [ "$hour" != "17" ]; then
-            echo "Not 9am/5pm ET; exiting."
-            exit 0
-          fi
           python scrape_mspca_final.py

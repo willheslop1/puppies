@@ -2,7 +2,8 @@ name: MSPCA Scraper
 
 on:
   schedule:
-    - cron: "0 * * * *"  # run hourly; gate by Eastern time below
+    # GitHub cron is UTC; run at both 12:00 and 13:00 UTC, then gate to 8am ET below.
+    - cron: "0 12,13 * * *"
   workflow_dispatch:
 
 jobs:
@@ -29,4 +30,11 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: |
+          if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
+            hour=$(TZ="America/New_York" date +%H)
+            if [ "$hour" != "08" ]; then
+              echo "Not 8am ET; exiting."
+              exit 0
+            fi
+          fi
           python scrape_mspca_final.py

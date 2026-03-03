@@ -1,6 +1,6 @@
 .vscode/
 cron.out
 cron.err
-mspca_dogs_final.csv
-*_mspca_dogs_final.csv
+*.csv
+__pycache__/
 scrape.log

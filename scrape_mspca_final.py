@@ -18,6 +18,7 @@ Notes:
 """
 
 import argparse
+import difflib
 import logging
 import os
 import re
@@ -41,24 +42,46 @@ HEADERS = {
 }
 
 HYPOALLERGENIC_PATTERNS = [
-    r"\bdoodle\b",
+    r"\bhypoallergenic\b",
+    r"\b[a-z]*doodle\b",
     r"\b[a-z]+poo\b",
-    r"\bpoodle\b",
-    r"\bbichon\b",
+    r"\bpoodle(?:s)?\b",
+    r"\bbichon(?: frise)?\b",
     r"\bmaltese\b",
-    r"\bschnauzer\b",
+    r"\bschnauzer(?:s)?\b",
     r"\byork(?:shire)? terrier\b",
-    r"\bshih tzu\b",
+    r"\byorkie\b",
+    r"\bshih ?tzu\b",
+    r"\bshi ?htzu\b",
+    r"\bshihtzu\b",
+    r"\bshitzu\b",
     r"\bhavanese\b",
     r"\bportuguese water dog\b",
-    r"\bwater dog\b",
-    r"\blagotto\b",
+    r"\bspanish water dog\b",
+    r"\blagotto(?: romagnolo)?\b",
     r"\bsoft coated wheaten\b",
     r"\bwheaten terrier\b",
     r"\bxolo(?:itzcuintli)?\b",
     r"\bchinese crested\b",
+    r"\bbedlington terrier\b",
+    r"\bcoton de tulear\b",
+    r"\bbolognese\b",
+    r"\blhasa apso\b",
+    r"\btibetan terrier\b",
+    r"\bwire fox terrier\b",
+    r"\bairedale terrier\b",
+    r"\bwelsh terrier\b",
+    r"\blakeland terrier\b",
+    r"\bnorwich terrier\b",
+    r"\bnorfolk terrier\b",
+    r"\bsealyham terrier\b",
+    r"\bdandie dinmont terrier\b",
+    r"\baustralian terrier\b",
+    r"\birish water spaniel\b",
+    r"\bpuli\b",
+    r"\bkomondor\b",
+    r"\baffenpinscher\b",
     r"\bbasenji\b",
-    r"\bafghan hound\b",
     r"\bkerry blue terrier\b",
     r"\bscottish terrier\b",
     r"\bwest highland white terrier\b",
@@ -66,13 +89,151 @@ HYPOALLERGENIC_PATTERNS = [
     r"\bcairn terrier\b",
     r"\bbarbet\b",
     r"\blowchen\b",
-    r"\bspanish water dog\b",
     r"\bperuvian (?:inca )?orchid\b",
     r"\bamerican hairless terrier\b",
     r"\bhairless\b",
 ]
 
 HYPOALLERGENIC_RE = re.compile("|".join(HYPOALLERGENIC_PATTERNS), re.IGNORECASE)
+LOW_SHEDDING_CANONICAL_BREEDS = [
+    "affenpinscher",
+    "afghan hound",
+    "airedale terrier",
+    "american hairless terrier",
+    "australian terrier",
+    "barbet",
+    "basenji",
+    "bedlington terrier",
+    "bichon frise",
+    "bolognese",
+    "border terrier",
+    "cairn terrier",
+    "chinese crested",
+    "coton de tulear",
+    "dandie dinmont terrier",
+    "giant schnauzer",
+    "havanese",
+    "irish water spaniel",
+    "kerry blue terrier",
+    "komondor",
+    "lagotto romagnolo",
+    "lakeland terrier",
+    "lhasa apso",
+    "lowchen",
+    "maltese",
+    "miniature schnauzer",
+    "norfolk terrier",
+    "norwich terrier",
+    "peruvian inca orchid",
+    "poodle",
+    "portuguese water dog",
+    "puli",
+    "scottish terrier",
+    "sealyham terrier",
+    "shih tzu",
+    "silky terrier",
+    "soft coated wheaten terrier",
+    "spanish water dog",
+    "standard schnauzer",
+    "tibetan terrier",
+    "west highland white terrier",
+    "welsh terrier",
+    "wire fox terrier",
+    "xoloitzcuintli",
+    "yorkshire terrier",
+]
+LOW_SHEDDING_FUZZY_TERMS = list(LOW_SHEDDING_CANONICAL_BREEDS) + [
+    "lagotto",
+    "wheaten terrier",
+    "wheaten",
+    "mini schnauzer",
+    "toy poodle",
+    "standard poodle",
+    "miniature poodle",
+]
+LOW_SHEDDING_BREED_SET = set(LOW_SHEDDING_CANONICAL_BREEDS)
+LOW_SHEDDING_ALIASES = {
+    "westie": "west highland white terrier",
+    "yorkie": "yorkshire terrier",
+    "scottie": "scottish terrier",
+    "xolo": "xoloitzcuintli",
+    "portie": "portuguese water dog",
+    "lagotto": "lagotto romagnolo",
+    "wheaten terrier": "soft coated wheaten terrier",
+    "wheaten": "soft coated wheaten terrier",
+    "mini schnauzer": "miniature schnauzer",
+    "miniature schnauzer": "miniature schnauzer",
+    "standard schnauzer": "standard schnauzer",
+    "giant schnauzer": "giant schnauzer",
+    "mini poodle": "poodle",
+    "toy poodle": "poodle",
+    "standard poodle": "poodle",
+    "miniature poodle": "poodle",
+    "shitzu": "shih tzu",
+    "shihtzu": "shih tzu",
+    "shi tzu": "shih tzu",
+    "l owchen": "lowchen",
+}
+
+
+def _normalize_breed_text(s: str) -> str:
+    lowered = _clean(s).lower()
+    lowered = re.sub(r"[^a-z0-9/,+&;|() -]", " ", lowered)
+    lowered = lowered.replace("(", " ").replace(")", " ")
+    lowered = re.sub(r"\s+", " ", lowered)
+    return lowered.strip()
+
+
+def _breed_segments(normalized_breed: str) -> List[str]:
+    cleaned = re.sub(
+        r"\b(mix(?:ed)?|cross(?:breed)?|xbreed|hybrid|blend)\b",
+        "/",
+        normalized_breed,
+    )
+    cleaned = re.sub(r"\b(with|and)\b", "/", cleaned)
+    cleaned = re.sub(r"\s+x\s+", "/", cleaned)
+    cleaned = cleaned.replace("&", "/").replace("+", "/").replace(";", "/").replace("|", "/")
+    parts = [p.strip() for p in re.split(r"[\/,]", cleaned) if p.strip()]
+    return parts
+
+
+def _canonicalize_breed(part: str) -> str:
+    p = part.strip()
+    if not p:
+        return ""
+    if p in LOW_SHEDDING_ALIASES:
+        return LOW_SHEDDING_ALIASES[p]
+    return p
+
+
+def _is_hypoallergenic_proxy(breed: str) -> int:
+    """
+    Evidence-informed proxy for low-shedding "hypoallergenic-like" breeds.
+    Studies show no breed is reliably hypoallergenic for Can f 1 exposure:
+    - 10.2500/ajra.2011.25.3606
+    - 10.1016/j.jaci.2012.05.013
+    - 10.1111/j.1398-9995.2005.00824.x
+    """
+    normalized = _normalize_breed_text(breed)
+    if not normalized:
+        return 0
+    if HYPOALLERGENIC_RE.search(normalized):
+        return 1
+
+    candidates = [_canonicalize_breed(normalized)] + [
+        _canonicalize_breed(p) for p in _breed_segments(normalized)
+    ]
+
+    for part in candidates:
+        if not part:
+            continue
+        if part in LOW_SHEDDING_BREED_SET:
+            return 1
+        if any(f" {breed_name} " in f" {part} " for breed_name in LOW_SHEDDING_BREED_SET):
+            return 1
+        if difflib.get_close_matches(part, LOW_SHEDDING_FUZZY_TERMS, n=1, cutoff=0.84):
+            return 1
+    return 0
 
 def _clean(s: str) -> str:
     return " ".join((s or "").split()).strip()
@@ -316,7 +477,7 @@ def scrape_all_dogs(
 
     if "breed" in df.columns:
         df["is_hypoallergenic"] = df["breed"].fillna("").apply(
-            lambda b: 1 if HYPOALLERGENIC_RE.search(b) else 0
+            _is_hypoallergenic_proxy
         )
 
     return df

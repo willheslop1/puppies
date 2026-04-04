@@ -15,6 +15,7 @@ Output:
   - new hypo candidates
   - existing hypo candidates (with updates flagged)
   - previously flagged hypo candidates no longer listed
+  - nearly-hypo candidates (borderline score band)
 
 Optional output:
 - full-dataset CSV and/or hypo-only CSV via CLI flags
@@ -48,7 +49,9 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; mspca-adoption-scraper/2.0; +https://example.com)"
 }
 
-HYPO_RULE_THRESHOLD = 60
+HYPO_RULE_THRESHOLD = 65
+NEAR_HYPO_MIN_SCORE = 45
+NEAR_HYPO_MAX_ITEMS = 5
 HYPO_REGEX_RULES = [
     ("explicit_hypoallergenic", re.compile(r"\bhypoallergenic\b", re.IGNORECASE), 95),
     ("doodle_family", re.compile(r"\b[a-z]*doodle\b", re.IGNORECASE), 72),
@@ -698,10 +701,41 @@ def build_hypo_change_sets(
     existing_rows.sort(key=lambda r: (r["name"].lower(), r["detail_url"].lower()))
     removed_rows.sort(key=lambda r: (r["name"].lower(), r["detail_url"].lower()))
 
+    near_rows: List[Dict[str, str]] = []
+    if {"is_hypoallergenic", "hypo_score"}.issubset(df.columns):
+        near_df = df[
+            (df["is_hypoallergenic"] == 0)
+            & (df["hypo_score"] >= NEAR_HYPO_MIN_SCORE)
+            & (df["hypo_score"] < HYPO_RULE_THRESHOLD)
+        ].copy()
+        if not near_df.empty:
+            near_df = near_df.sort_values(
+                by=["hypo_score", "name"],
+                ascending=[False, True],
+            ).head(NEAR_HYPO_MAX_ITEMS)
+            for _, row in near_df.iterrows():
+                near_rows.append({
+                    "status": "near_hypo",
+                    "changed_fields": "",
+                    "name": _safe_text(row.get("name", "")),
+                    "breed": _safe_text(row.get("breed", "")),
+                    "location": _safe_text(row.get("location", "")),
+                    "gender": _safe_text(row.get("gender", "")),
+                    "age": _safe_text(row.get("age", "")),
+                    "detail_url": _safe_text(row.get("detail_url", "")),
+                    "image_url": _safe_text(row.get("image_url", "")),
+                    "hypo_score": _safe_text(row.get("hypo_score", "")),
+                    "hypo_confidence": _safe_text(row.get("hypo_confidence", "")),
+                    "hypo_reasons": _safe_text(row.get("hypo_reasons", "")),
+                    "first_seen": "",
+                    "last_seen": "",
+                })
+
     return {
         "new_rows": new_rows,
         "existing_rows": existing_rows,
         "removed_rows": removed_rows,
+        "near_rows": near_rows,
         "current_state_dogs": current_state_dogs,
     }
 
@@ -737,6 +771,7 @@ def build_hypo_email_body(
     new_rows: List[Dict[str, str]],
     existing_rows: List[Dict[str, str]],
     removed_rows: List[Dict[str, str]],
+    near_rows: List[Dict[str, str]],
 ) -> str:
     now_local = datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [
@@ -746,6 +781,7 @@ def build_hypo_email_body(
         f"New hypo candidates: {len(new_rows)}",
         f"Existing hypo candidates: {len(existing_rows)}",
         f"Previously flagged, now no longer listed: {len(removed_rows)}",
+        f"Nearly-hypo candidates: {len(near_rows)} (score {NEAR_HYPO_MIN_SCORE}-{HYPO_RULE_THRESHOLD - 1}, capped at {NEAR_HYPO_MAX_ITEMS})",
         f"Rule threshold: score >= {HYPO_RULE_THRESHOLD}",
         "",
         "=== NEW HYPO DOGS ===",
@@ -764,6 +800,12 @@ def build_hypo_email_body(
     lines.extend(["", "=== PREVIOUSLY FLAGGED, NOW NO LONGER LISTED ==="])
     if removed_rows:
         lines.extend(_dog_bullet(row) for row in removed_rows)
+    else:
+        lines.append("- none")
+
+    lines.extend(["", f"=== NEARLY-HYPO DOGS (score {NEAR_HYPO_MIN_SCORE}-{HYPO_RULE_THRESHOLD - 1}, top {NEAR_HYPO_MAX_ITEMS}) ==="])
+    if near_rows:
+        lines.extend(_dog_bullet(row) for row in near_rows)
     else:
         lines.append("- none")
 
@@ -847,12 +889,14 @@ if __name__ == "__main__":
     new_rows = change_sets["new_rows"]
     existing_rows = change_sets["existing_rows"]
     removed_rows = change_sets["removed_rows"]
+    near_rows = change_sets["near_rows"]
 
     logging.info(
-        "hypo summary: new=%s existing=%s no_longer_listed=%s",
+        "hypo summary: new=%s existing=%s no_longer_listed=%s near=%s",
         len(new_rows),
         len(existing_rows),
         len(removed_rows),
+        len(near_rows),
     )
 
     timestamp = datetime.now().strftime("%Y.%m.%d_%H.%M")
@@ -876,9 +920,9 @@ if __name__ == "__main__":
 
     subject_prefix = (
         "MSPCA Hypo Update "
-        f"(new: {len(new_rows)}, existing: {len(existing_rows)}, removed: {len(removed_rows)})"
+        f"(new: {len(new_rows)}, existing: {len(existing_rows)}, removed: {len(removed_rows)}, near: {len(near_rows)})"
     )
-    email_body = build_hypo_email_body(len(df), new_rows, existing_rows, removed_rows)
+    email_body = build_hypo_email_body(len(df), new_rows, existing_rows, removed_rows, near_rows)
     email_sent = send_email_report(
         body=email_body,
         subject_prefix=subject_prefix,

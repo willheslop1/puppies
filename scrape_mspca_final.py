@@ -48,60 +48,13 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; mspca-adoption-scraper/2.0; +https://example.com)"
 }
 
-HYPOALLERGENIC_PATTERNS = [
-    r"\bhypoallergenic\b",
-    r"\b[a-z]*doodle\b",
-    r"\b[a-z]+poo\b",
-    r"\bpoodle(?:s)?\b",
-    r"\bbichon(?: frise)?\b",
-    r"\bmaltese\b",
-    r"\bschnauzer(?:s)?\b",
-    r"\byork(?:shire)? terrier\b",
-    r"\byorkie\b",
-    r"\bshih ?tzu\b",
-    r"\bshi ?htzu\b",
-    r"\bshihtzu\b",
-    r"\bshitzu\b",
-    r"\bhavanese\b",
-    r"\bportuguese water dog\b",
-    r"\bspanish water dog\b",
-    r"\blagotto(?: romagnolo)?\b",
-    r"\bsoft coated wheaten\b",
-    r"\bwheaten terrier\b",
-    r"\bxolo(?:itzcuintli)?\b",
-    r"\bchinese crested\b",
-    r"\bbedlington terrier\b",
-    r"\bcoton de tulear\b",
-    r"\bbolognese\b",
-    r"\blhasa apso\b",
-    r"\btibetan terrier\b",
-    r"\bwire fox terrier\b",
-    r"\bairedale terrier\b",
-    r"\bwelsh terrier\b",
-    r"\blakeland terrier\b",
-    r"\bnorwich terrier\b",
-    r"\bnorfolk terrier\b",
-    r"\bsealyham terrier\b",
-    r"\bdandie dinmont terrier\b",
-    r"\baustralian terrier\b",
-    r"\birish water spaniel\b",
-    r"\bpuli\b",
-    r"\bkomondor\b",
-    r"\baffenpinscher\b",
-    r"\bbasenji\b",
-    r"\bkerry blue terrier\b",
-    r"\bscottish terrier\b",
-    r"\bwest highland white terrier\b",
-    r"\bwestie\b",
-    r"\bcairn terrier\b",
-    r"\bbarbet\b",
-    r"\blowchen\b",
-    r"\bperuvian (?:inca )?orchid\b",
-    r"\bamerican hairless terrier\b",
-    r"\bhairless\b",
+HYPO_RULE_THRESHOLD = 60
+HYPO_REGEX_RULES = [
+    ("explicit_hypoallergenic", re.compile(r"\bhypoallergenic\b", re.IGNORECASE), 95),
+    ("doodle_family", re.compile(r"\b[a-z]*doodle\b", re.IGNORECASE), 72),
+    ("poo_family", re.compile(r"\b[a-z]+poo\b", re.IGNORECASE), 72),
+    ("hairless_keyword", re.compile(r"\bhairless\b", re.IGNORECASE), 75),
 ]
-
-HYPOALLERGENIC_RE = re.compile("|".join(HYPOALLERGENIC_PATTERNS), re.IGNORECASE)
 LOW_SHEDDING_CANONICAL_BREEDS = [
     "affenpinscher",
     "afghan hound",
@@ -159,6 +112,40 @@ LOW_SHEDDING_FUZZY_TERMS = list(LOW_SHEDDING_CANONICAL_BREEDS) + [
     "miniature poodle",
 ]
 LOW_SHEDDING_BREED_SET = set(LOW_SHEDDING_CANONICAL_BREEDS)
+HEAVY_SHEDDING_CANONICAL_BREEDS = [
+    "akita",
+    "alaskan malamute",
+    "australian cattle dog",
+    "beagle",
+    "bernese mountain dog",
+    "bloodhound",
+    "border collie",
+    "boxer",
+    "bulldog",
+    "cane corso",
+    "chow chow",
+    "cocker spaniel",
+    "doberman pinscher",
+    "english setter",
+    "german shepherd",
+    "golden retriever",
+    "great dane",
+    "great pyrenees",
+    "husky",
+    "keeshond",
+    "labrador retriever",
+    "mastiff",
+    "newfoundland",
+    "pit bull terrier",
+    "pointer",
+    "pug",
+    "rottweiler",
+    "saint bernard",
+    "samoyed",
+    "shiba inu",
+    "siberian husky",
+]
+HEAVY_SHEDDING_BREED_SET = set(HEAVY_SHEDDING_CANONICAL_BREEDS)
 LOW_SHEDDING_ALIASES = {
     "westie": "west highland white terrier",
     "yorkie": "yorkshire terrier",
@@ -213,7 +200,22 @@ def _canonicalize_breed(part: str) -> str:
     return p
 
 
-def _is_hypoallergenic_proxy(breed: str) -> int:
+def _contains_any_breed_name(part: str, breed_set: set[str]) -> str:
+    for breed_name in breed_set:
+        if f" {breed_name} " in f" {part} ":
+            return breed_name
+    return ""
+
+
+def _hypo_confidence(score: int) -> str:
+    if score >= 80:
+        return "high"
+    if score >= HYPO_RULE_THRESHOLD:
+        return "medium"
+    return "low"
+
+
+def _score_hypoallergenic_proxy(breed: str) -> Dict[str, Any]:
     """
     Evidence-informed proxy for low-shedding "hypoallergenic-like" breeds.
     Studies show no breed is reliably hypoallergenic for Can f 1 exposure:
@@ -223,24 +225,84 @@ def _is_hypoallergenic_proxy(breed: str) -> int:
     """
     normalized = _normalize_breed_text(breed)
     if not normalized:
-        return 0
-    if HYPOALLERGENIC_RE.search(normalized):
-        return 1
+        return {
+            "score": 0,
+            "confidence": "low",
+            "is_candidate": 0,
+            "reasons": [],
+        }
 
     candidates = [_canonicalize_breed(normalized)] + [
         _canonicalize_breed(p) for p in _breed_segments(normalized)
     ]
+    candidates = [p for p in dict.fromkeys(candidates) if p]
+
+    reasons: List[str] = []
+    seen_reasons = set()
+
+    def add_reason(reason: str) -> None:
+        if reason not in seen_reasons:
+            reasons.append(reason)
+            seen_reasons.add(reason)
+
+    regex_points = 0
+    for rule_name, regex, weight in HYPO_REGEX_RULES:
+        if regex.search(normalized):
+            regex_points = max(regex_points, weight)
+            add_reason(f"{rule_name}(+{weight})")
+
+    breed_points = 0
+    penalties = 0
 
     for part in candidates:
-        if not part:
-            continue
         if part in LOW_SHEDDING_BREED_SET:
-            return 1
-        if any(f" {breed_name} " in f" {part} " for breed_name in LOW_SHEDDING_BREED_SET):
-            return 1
-        if difflib.get_close_matches(part, LOW_SHEDDING_FUZZY_TERMS, n=1, cutoff=0.84):
-            return 1
-    return 0
+            breed_points = max(breed_points, 82)
+            add_reason(f"exact_low_shedding:{part}(+82)")
+        else:
+            contained_low = _contains_any_breed_name(part, LOW_SHEDDING_BREED_SET)
+            if contained_low:
+                breed_points = max(breed_points, 68)
+                add_reason(f"contains_low_shedding:{contained_low}(+68)")
+            else:
+                fuzzy_match = difflib.get_close_matches(
+                    part,
+                    LOW_SHEDDING_FUZZY_TERMS,
+                    n=1,
+                    cutoff=0.90,
+                )
+                if fuzzy_match:
+                    breed_points = max(breed_points, 50)
+                    add_reason(f"fuzzy_low_shedding:{fuzzy_match[0]}(+50)")
+
+        if part in HEAVY_SHEDDING_BREED_SET:
+            penalties += 10
+            add_reason(f"heavy_shedding_penalty:{part}(-10)")
+        else:
+            contained_heavy = _contains_any_breed_name(part, HEAVY_SHEDDING_BREED_SET)
+            if contained_heavy:
+                penalties += 6
+                add_reason(f"contains_heavy_shedding:{contained_heavy}(-6)")
+
+    positive_points = max(regex_points, breed_points)
+    if positive_points > 0 and penalties > 0:
+        penalties += 4
+        add_reason("mixed_with_heavy_shedding_penalty(-4)")
+
+    penalties = min(penalties, 40)
+    score = max(0, min(100, positive_points - penalties))
+    confidence = _hypo_confidence(score)
+    is_candidate = 1 if score >= HYPO_RULE_THRESHOLD else 0
+
+    return {
+        "score": score,
+        "confidence": confidence,
+        "is_candidate": is_candidate,
+        "reasons": reasons,
+    }
+
+
+def _is_hypoallergenic_proxy(breed: str) -> int:
+    return _score_hypoallergenic_proxy(breed)["is_candidate"]
 
 def _clean(s: str) -> str:
     return " ".join((s or "").split()).strip()
@@ -483,9 +545,11 @@ def scrape_all_dogs(
         df = pd.concat([df.drop(columns=["raw_stats"]), stats_df, df[["raw_stats"]]], axis=1)
 
     if "breed" in df.columns:
-        df["is_hypoallergenic"] = df["breed"].fillna("").apply(
-            _is_hypoallergenic_proxy
-        )
+        scored = df["breed"].fillna("").apply(_score_hypoallergenic_proxy)
+        df["hypo_score"] = scored.apply(lambda x: x["score"])
+        df["hypo_confidence"] = scored.apply(lambda x: x["confidence"])
+        df["hypo_reasons"] = scored.apply(lambda x: "; ".join(x["reasons"]))
+        df["is_hypoallergenic"] = scored.apply(lambda x: x["is_candidate"])
 
     return df
 
@@ -566,7 +630,18 @@ def build_hypo_change_sets(
     current_state_dogs: Dict[str, Dict[str, str]] = {}
     current_keys = set()
 
-    tracked_fields = ["name", "breed", "location", "gender", "age", "detail_url", "image_url"]
+    tracked_fields = [
+        "name",
+        "breed",
+        "location",
+        "gender",
+        "age",
+        "detail_url",
+        "image_url",
+        "hypo_score",
+        "hypo_confidence",
+        "hypo_reasons",
+    ]
     diff_fields = ["name", "breed", "location", "gender", "age"]
 
     for _, row in hypo_df.iterrows():
@@ -612,6 +687,9 @@ def build_hypo_change_sets(
             "age": _safe_text(prev_snapshot.get("age", "")),
             "detail_url": _safe_text(prev_snapshot.get("detail_url", "")),
             "image_url": _safe_text(prev_snapshot.get("image_url", "")),
+            "hypo_score": _safe_text(prev_snapshot.get("hypo_score", "")),
+            "hypo_confidence": _safe_text(prev_snapshot.get("hypo_confidence", "")),
+            "hypo_reasons": _safe_text(prev_snapshot.get("hypo_reasons", "")),
             "first_seen": _safe_text(prev_snapshot.get("first_seen", "")),
             "last_seen": _safe_text(prev_snapshot.get("last_seen", "")),
         })
@@ -636,8 +714,18 @@ def _dog_bullet(row: Dict[str, str], include_change_flag: bool = False) -> str:
         row.get("age", "") or "Unknown age",
     ]
     line = f"- {' | '.join(pieces)}"
+    score = _safe_text(row.get("hypo_score", ""))
+    confidence = _safe_text(row.get("hypo_confidence", ""))
+    if score:
+        if confidence:
+            line += f" [score: {score}, confidence: {confidence}]"
+        else:
+            line += f" [score: {score}]"
     if include_change_flag and row.get("changed_fields"):
         line += f" [UPDATED: {row['changed_fields']}]"
+    reasons = _safe_text(row.get("hypo_reasons", ""))
+    if reasons:
+        line += f"\n  reasons: {reasons}"
     detail_url = row.get("detail_url", "")
     if detail_url:
         line += f"\n  {detail_url}"
@@ -658,6 +746,7 @@ def build_hypo_email_body(
         f"New hypo candidates: {len(new_rows)}",
         f"Existing hypo candidates: {len(existing_rows)}",
         f"Previously flagged, now no longer listed: {len(removed_rows)}",
+        f"Rule threshold: score >= {HYPO_RULE_THRESHOLD}",
         "",
         "=== NEW HYPO DOGS ===",
     ]

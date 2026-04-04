@@ -803,7 +803,7 @@ def build_hypo_change_sets(
             if not dog_key:
                 continue
             score = _safe_int(score_row.get("hypo_score", 0), 0)
-            if 0 <= score < HYPO_RULE_THRESHOLD:
+            if 0 < score < HYPO_RULE_THRESHOLD:
                 current_non_hypo_score_by_dog[dog_key] = score
 
     historical_score_by_dog_raw = prior_model.get("score_by_dog", {})
@@ -818,7 +818,7 @@ def build_hypo_change_sets(
     if not historical_non_hypo_score_by_dog and isinstance(prior_model.get("score_history", []), list):
         for idx, score in enumerate(prior_model.get("score_history", [])):
             s = _safe_int(score, 0)
-            if 0 <= s < HYPO_RULE_THRESHOLD:
+            if 0 < s < HYPO_RULE_THRESHOLD:
                 historical_non_hypo_score_by_dog[f"legacy_{idx}"] = s
 
     current_non_hypo_scores = list(current_non_hypo_score_by_dog.values())
@@ -830,6 +830,7 @@ def build_hypo_change_sets(
     if {"is_hypoallergenic", "hypo_score", "dog_key"}.issubset(working_df.columns):
         non_hypo_df = working_df[
             (working_df["is_hypoallergenic"] == 0)
+            & (working_df["hypo_score"] > 0)
             & (working_df["hypo_score"] < HYPO_RULE_THRESHOLD)
         ].copy()
         non_hypo_df = non_hypo_df.sort_values(by=["hypo_score", "name"], ascending=[False, True])

@@ -3,4 +3,5 @@ cron.out
 cron.err
 *.csv
 __pycache__/
+.state/
 scrape.log

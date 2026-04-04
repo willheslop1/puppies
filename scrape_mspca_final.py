@@ -11,7 +11,13 @@ What this version adds vs. your original:
 - More resilient to MSPCA changing card text formatting
 
 Output:
-- mspca_dogs_final.csv
+- Email summary focused on hypoallergenic candidates:
+  - new hypo candidates
+  - existing hypo candidates (with updates flagged)
+  - previously flagged hypo candidates no longer listed
+
+Optional output:
+- full-dataset CSV and/or hypo-only CSV via CLI flags
 
 Notes:
 - This intentionally does NOT visit individual dog detail pages.
@@ -19,6 +25,7 @@ Notes:
 
 import argparse
 import difflib
+import json
 import logging
 import os
 import re
@@ -483,12 +490,202 @@ def scrape_all_dogs(
     return df
 
 
-def send_email_with_csv(
-    csv_path: str,
-    row_count: int,
-    hypo_count: int,
-    subject_prefix: str = "MSCPA Dogs",
-) -> None:
+def _safe_text(value: Any) -> str:
+    if value is None:
+        return ""
+    is_na = pd.isna(value)
+    if is_na is pd.NA:
+        return ""
+    if isinstance(is_na, bool) and is_na:
+        return ""
+    return _clean(str(value))
+
+
+def _dog_key_from_row(row: pd.Series) -> str:
+    detail_url = _safe_text(row.get("detail_url", ""))
+    if detail_url:
+        return detail_url
+    return "|".join([
+        _safe_text(row.get("name", "")).lower(),
+        _safe_text(row.get("breed", "")).lower(),
+        _safe_text(row.get("location", "")).lower(),
+        _safe_text(row.get("gender", "")).lower(),
+        _safe_text(row.get("age", "")).lower(),
+    ])
+
+
+def load_hypo_state(state_path: str) -> Dict[str, Any]:
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {"dogs": {}}
+    except (OSError, json.JSONDecodeError) as exc:
+        logging.warning("failed to load state file %s: %s", state_path, exc)
+        return {"dogs": {}}
+
+    dogs = data.get("dogs", {})
+    if not isinstance(dogs, dict):
+        dogs = {}
+    return {"dogs": dogs}
+
+
+def save_hypo_state(state_path: str, dogs: Dict[str, Dict[str, str]]) -> None:
+    state_dir = os.path.dirname(state_path)
+    if state_dir:
+        os.makedirs(state_dir, exist_ok=True)
+
+    payload = {
+        "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "dogs": dogs,
+    }
+    with open(state_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+
+
+def build_hypo_change_sets(
+    df: pd.DataFrame,
+    prior_state: Dict[str, Any],
+) -> Dict[str, Any]:
+    prior_dogs = prior_state.get("dogs", {}) if isinstance(prior_state, dict) else {}
+    prior_keys = set(prior_dogs.keys())
+    now_utc = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+    if "is_hypoallergenic" not in df.columns:
+        hypo_df = pd.DataFrame(columns=df.columns)
+    else:
+        hypo_df = df[df["is_hypoallergenic"] == 1].copy()
+
+    if not hypo_df.empty:
+        hypo_df["dog_key"] = hypo_df.apply(_dog_key_from_row, axis=1)
+    else:
+        hypo_df["dog_key"] = pd.Series(dtype=str)
+
+    new_rows: List[Dict[str, str]] = []
+    existing_rows: List[Dict[str, str]] = []
+    current_state_dogs: Dict[str, Dict[str, str]] = {}
+    current_keys = set()
+
+    tracked_fields = ["name", "breed", "location", "gender", "age", "detail_url", "image_url"]
+    diff_fields = ["name", "breed", "location", "gender", "age"]
+
+    for _, row in hypo_df.iterrows():
+        dog_key = _safe_text(row.get("dog_key", ""))
+        if not dog_key:
+            continue
+        current_keys.add(dog_key)
+
+        dog_snapshot = {field: _safe_text(row.get(field, "")) for field in tracked_fields}
+        prev_snapshot = prior_dogs.get(dog_key, {})
+
+        changed_fields = []
+        if prev_snapshot:
+            for field in diff_fields:
+                if dog_snapshot[field] != _safe_text(prev_snapshot.get(field, "")):
+                    changed_fields.append(field)
+
+        first_seen = _safe_text(prev_snapshot.get("first_seen", "")) or now_utc
+        dog_snapshot["first_seen"] = first_seen
+        dog_snapshot["last_seen"] = now_utc
+        current_state_dogs[dog_key] = dog_snapshot
+
+        report_row = {
+            "status": "new" if not prev_snapshot else ("existing_updated" if changed_fields else "existing"),
+            "changed_fields": ", ".join(changed_fields),
+            **dog_snapshot,
+        }
+        if report_row["status"] == "new":
+            new_rows.append(report_row)
+        else:
+            existing_rows.append(report_row)
+
+    removed_rows: List[Dict[str, str]] = []
+    for dog_key in sorted(prior_keys - current_keys):
+        prev_snapshot = prior_dogs.get(dog_key, {})
+        removed_rows.append({
+            "status": "no_longer_listed",
+            "changed_fields": "",
+            "name": _safe_text(prev_snapshot.get("name", "")),
+            "breed": _safe_text(prev_snapshot.get("breed", "")),
+            "location": _safe_text(prev_snapshot.get("location", "")),
+            "gender": _safe_text(prev_snapshot.get("gender", "")),
+            "age": _safe_text(prev_snapshot.get("age", "")),
+            "detail_url": _safe_text(prev_snapshot.get("detail_url", "")),
+            "image_url": _safe_text(prev_snapshot.get("image_url", "")),
+            "first_seen": _safe_text(prev_snapshot.get("first_seen", "")),
+            "last_seen": _safe_text(prev_snapshot.get("last_seen", "")),
+        })
+
+    new_rows.sort(key=lambda r: (r["name"].lower(), r["detail_url"].lower()))
+    existing_rows.sort(key=lambda r: (r["name"].lower(), r["detail_url"].lower()))
+    removed_rows.sort(key=lambda r: (r["name"].lower(), r["detail_url"].lower()))
+
+    return {
+        "new_rows": new_rows,
+        "existing_rows": existing_rows,
+        "removed_rows": removed_rows,
+        "current_state_dogs": current_state_dogs,
+    }
+
+
+def _dog_bullet(row: Dict[str, str], include_change_flag: bool = False) -> str:
+    pieces = [
+        row.get("name", "") or "Unknown name",
+        row.get("breed", "") or "Unknown breed",
+        row.get("location", "") or "Unknown location",
+        row.get("age", "") or "Unknown age",
+    ]
+    line = f"- {' | '.join(pieces)}"
+    if include_change_flag and row.get("changed_fields"):
+        line += f" [UPDATED: {row['changed_fields']}]"
+    detail_url = row.get("detail_url", "")
+    if detail_url:
+        line += f"\n  {detail_url}"
+    return line
+
+
+def build_hypo_email_body(
+    total_dogs: int,
+    new_rows: List[Dict[str, str]],
+    existing_rows: List[Dict[str, str]],
+    removed_rows: List[Dict[str, str]],
+) -> str:
+    now_local = datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines = [
+        f"MSPCA hypoallergenic update ({now_local})",
+        "",
+        f"Total dogs scraped: {total_dogs}",
+        f"New hypo candidates: {len(new_rows)}",
+        f"Existing hypo candidates: {len(existing_rows)}",
+        f"Previously flagged, now no longer listed: {len(removed_rows)}",
+        "",
+        "=== NEW HYPO DOGS ===",
+    ]
+    if new_rows:
+        lines.extend(_dog_bullet(row) for row in new_rows)
+    else:
+        lines.append("- none")
+
+    lines.extend(["", "=== EXISTING HYPO DOGS (updates flagged) ==="])
+    if existing_rows:
+        lines.extend(_dog_bullet(row, include_change_flag=True) for row in existing_rows)
+    else:
+        lines.append("- none")
+
+    lines.extend(["", "=== PREVIOUSLY FLAGGED, NOW NO LONGER LISTED ==="])
+    if removed_rows:
+        lines.extend(_dog_bullet(row) for row in removed_rows)
+    else:
+        lines.append("- none")
+
+    return "\n".join(lines)
+
+
+def send_email_report(
+    body: str,
+    subject_prefix: str = "MSPCA Hypo Update",
+    attachment_path: str = "",
+) -> bool:
     smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
     smtp_port = int(os.environ.get("SMTP_PORT", "587"))
     smtp_user = os.environ.get("SMTP_USER", "")
@@ -505,21 +702,16 @@ def send_email_with_csv(
     msg["From"] = smtp_user
     msg["To"] = email_to
     msg["Subject"] = subject
-    msg.set_content(
-        "Attached: "
-        f"{row_count} dogs.\n"
-        f"Total dogs: {row_count}\n"
-        f"Hypoallergenic: {hypo_count}\n"
-        f"Generated at {now}."
-    )
+    msg.set_content(body)
 
-    with open(csv_path, "rb") as f:
-        msg.add_attachment(
-            f.read(),
-            maintype="text",
-            subtype="csv",
-            filename=os.path.basename(csv_path),
-        )
+    if attachment_path and os.path.exists(attachment_path):
+        with open(attachment_path, "rb") as f:
+            msg.add_attachment(
+                f.read(),
+                maintype="text",
+                subtype="csv",
+                filename=os.path.basename(attachment_path),
+            )
 
     try:
         with smtplib.SMTP(smtp_host, smtp_port) as server:
@@ -542,6 +734,9 @@ if __name__ == "__main__":
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--backoff-s", type=float, default=1.0)
     parser.add_argument("--log-path", default="scrape.log")
+    parser.add_argument("--state-path", default=".state/mspca_hypo_state.json")
+    parser.add_argument("--save-full-csv", action="store_true")
+    parser.add_argument("--save-hypo-csv", action="store_true")
     parser.add_argument("--output-prefix", default="")
     args = parser.parse_args()
 
@@ -557,13 +752,49 @@ if __name__ == "__main__":
         backoff_s=args.backoff_s,
     )
     logging.info("scraped %s dogs", len(df))
+
+    prior_state = load_hypo_state(args.state_path)
+    change_sets = build_hypo_change_sets(df, prior_state)
+    new_rows = change_sets["new_rows"]
+    existing_rows = change_sets["existing_rows"]
+    removed_rows = change_sets["removed_rows"]
+
+    logging.info(
+        "hypo summary: new=%s existing=%s no_longer_listed=%s",
+        len(new_rows),
+        len(existing_rows),
+        len(removed_rows),
+    )
+
     timestamp = datetime.now().strftime("%Y.%m.%d_%H.%M")
     prefix = args.output_prefix
-    output_path = f"{prefix}{timestamp}_mspca_dogs_final.csv"
-    df.to_csv(output_path, index=False)
-    logging.info("saved %s dogs to %s", len(df), output_path)
-    hypo_count = int(df["is_hypoallergenic"].sum()) if "is_hypoallergenic" in df.columns else 0
-    email_sent = send_email_with_csv(output_path, len(df), hypo_count)
+
+    if args.save_full_csv:
+        output_path = f"{prefix}{timestamp}_mspca_dogs_final.csv"
+        df.to_csv(output_path, index=False)
+        logging.info("saved full dataset: %s", output_path)
+
+    hypo_csv_path = ""
+    if args.save_hypo_csv:
+        hypo_rows = new_rows + existing_rows
+        hypo_df = pd.DataFrame(hypo_rows)
+        hypo_csv_path = f"{prefix}{timestamp}_mspca_hypo_dogs.csv"
+        hypo_df.to_csv(hypo_csv_path, index=False)
+        logging.info("saved hypo dataset: %s", hypo_csv_path)
+
+    save_hypo_state(args.state_path, change_sets["current_state_dogs"])
+    logging.info("saved state to %s", args.state_path)
+
+    subject_prefix = (
+        "MSPCA Hypo Update "
+        f"(new: {len(new_rows)}, existing: {len(existing_rows)}, removed: {len(removed_rows)})"
+    )
+    email_body = build_hypo_email_body(len(df), new_rows, existing_rows, removed_rows)
+    email_sent = send_email_report(
+        body=email_body,
+        subject_prefix=subject_prefix,
+        attachment_path=hypo_csv_path,
+    )
     if email_sent:
         logging.info("email sent")
     else:

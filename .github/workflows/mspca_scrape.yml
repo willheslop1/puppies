@@ -22,6 +22,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 pandas
 
+      - name: Restore hypo state
+        uses: actions/cache/restore@v4
+        with:
+          path: .state/mspca_hypo_state.json
+          key: mspca-hypo-state-${{ github.run_id }}
+          restore-keys: |
+            mspca-hypo-state-
+
       - name: Run scraper
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
@@ -31,3 +39,10 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: |
           python scrape_mspca_final.py
+
+      - name: Save hypo state
+        if: always() && hashFiles('.state/mspca_hypo_state.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .state/mspca_hypo_state.json
+          key: mspca-hypo-state-${{ github.run_id }}

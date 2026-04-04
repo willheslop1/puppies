@@ -613,6 +613,22 @@ def _compute_adaptive_near_threshold(
     }
 
 
+def _prune_score_by_dog(
+    score_by_dog: Dict[str, int],
+    all_dogs_state: Dict[str, Dict[str, str]],
+    max_items: int,
+) -> Dict[str, int]:
+    if len(score_by_dog) <= max_items:
+        return score_by_dog
+
+    ranked = sorted(
+        score_by_dog.items(),
+        key=lambda kv: _safe_text(all_dogs_state.get(kv[0], {}).get("last_seen", "")),
+        reverse=True,
+    )
+    return dict(ranked[:max_items])
+
+
 def _dog_key_from_row(row: pd.Series) -> str:
     detail_url = _safe_text(row.get("detail_url", ""))
     if detail_url:
@@ -779,18 +795,34 @@ def build_hypo_change_sets(
     existing_rows.sort(key=lambda r: (r["name"].lower(), r["detail_url"].lower()))
     removed_rows.sort(key=lambda r: (r["name"].lower(), r["detail_url"].lower()))
 
-    current_non_hypo_scores = []
-    if "is_hypoallergenic" in working_df.columns and "hypo_score" in working_df.columns:
-        current_non_hypo_scores = [
-            _safe_int(v)
-            for v in working_df.loc[working_df["is_hypoallergenic"] == 0, "hypo_score"].tolist()
-            if 0 <= _safe_int(v) < HYPO_RULE_THRESHOLD
-        ]
-    historical_non_hypo_scores = [
-        _safe_int(v)
-        for v in prior_model.get("score_history", [])
-        if 0 <= _safe_int(v) < HYPO_RULE_THRESHOLD
-    ]
+    current_non_hypo_score_by_dog: Dict[str, int] = {}
+    if {"is_hypoallergenic", "hypo_score", "dog_key"}.issubset(working_df.columns):
+        non_hypo_scores_df = working_df[working_df["is_hypoallergenic"] == 0][["dog_key", "hypo_score"]]
+        for _, score_row in non_hypo_scores_df.iterrows():
+            dog_key = _safe_text(score_row.get("dog_key", ""))
+            if not dog_key:
+                continue
+            score = _safe_int(score_row.get("hypo_score", 0), 0)
+            if 0 <= score < HYPO_RULE_THRESHOLD:
+                current_non_hypo_score_by_dog[dog_key] = score
+
+    historical_score_by_dog_raw = prior_model.get("score_by_dog", {})
+    if not isinstance(historical_score_by_dog_raw, dict):
+        historical_score_by_dog_raw = {}
+    historical_non_hypo_score_by_dog = {
+        _safe_text(k): _safe_int(v, 0)
+        for k, v in historical_score_by_dog_raw.items()
+        if _safe_text(k)
+    }
+    # Backward-compat: if older state only has score_history, seed from that.
+    if not historical_non_hypo_score_by_dog and isinstance(prior_model.get("score_history", []), list):
+        for idx, score in enumerate(prior_model.get("score_history", [])):
+            s = _safe_int(score, 0)
+            if 0 <= s < HYPO_RULE_THRESHOLD:
+                historical_non_hypo_score_by_dog[f"legacy_{idx}"] = s
+
+    current_non_hypo_scores = list(current_non_hypo_score_by_dog.values())
+    historical_non_hypo_scores = list(historical_non_hypo_score_by_dog.values())
     adaptive = _compute_adaptive_near_threshold(current_non_hypo_scores, historical_non_hypo_scores)
     adaptive_threshold = adaptive["threshold"]
 
@@ -846,11 +878,23 @@ def build_hypo_change_sets(
             "last_seen": now_utc,
         }
 
-    model_score_history = historical_non_hypo_scores + current_non_hypo_scores
-    model_score_history = model_score_history[-MODEL_SCORE_HISTORY_MAX:]
+    merged_score_by_dog = dict(historical_non_hypo_score_by_dog)
+    merged_score_by_dog.update(current_non_hypo_score_by_dog)
+    if any(not k.startswith("legacy_") for k in merged_score_by_dog):
+        merged_score_by_dog = {
+            k: v for k, v in merged_score_by_dog.items() if not k.startswith("legacy_")
+        }
+    merged_score_by_dog = _prune_score_by_dog(
+        merged_score_by_dog,
+        all_dogs_state,
+        MODEL_SCORE_HISTORY_MAX,
+    )
+    model_score_history = list(merged_score_by_dog.values())
     model_state = {
         "run_count": _safe_int(prior_model.get("run_count", 0), 0) + 1,
+        "score_by_dog": merged_score_by_dog,
         "score_history": model_score_history,
+        "unique_dogs_in_model": len(merged_score_by_dog),
         "adaptive_near_threshold": adaptive_threshold,
         "adaptive_percentile_q": round(adaptive["percentile_q"], 4),
         "adaptive_pool_size": adaptive["pool_size"],

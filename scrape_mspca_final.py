@@ -52,6 +52,9 @@ HEADERS = {
 HYPO_RULE_THRESHOLD = 65
 NEAR_HYPO_MIN_SCORE = 45
 NEAR_HYPO_MAX_ITEMS = 5
+ADAPTIVE_TARGET_NEAR_PER_RUN = 2
+ADAPTIVE_NEAR_MIN_FLOOR = 35
+MODEL_SCORE_HISTORY_MAX = 5000
 HYPO_REGEX_RULES = [
     ("explicit_hypoallergenic", re.compile(r"\bhypoallergenic\b", re.IGNORECASE), 95),
     ("doodle_family", re.compile(r"\b[a-z]*doodle\b", re.IGNORECASE), 72),
@@ -568,6 +571,48 @@ def _safe_text(value: Any) -> str:
     return _clean(str(value))
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _quantile_value(values: List[int], q: float) -> int:
+    if not values:
+        return 0
+    ordered = sorted(values)
+    q = max(0.0, min(1.0, q))
+    idx = int(round((len(ordered) - 1) * q))
+    return ordered[idx]
+
+
+def _compute_adaptive_near_threshold(
+    current_non_hypo_scores: List[int],
+    historical_non_hypo_scores: List[int],
+) -> Dict[str, Any]:
+    # Target percentile based on current run size: aim for ~N candidates each run.
+    denom = max(len(current_non_hypo_scores), 1)
+    percentile_q = max(0.0, min(1.0, 1.0 - (ADAPTIVE_TARGET_NEAR_PER_RUN / denom)))
+
+    pool = [
+        s
+        for s in (historical_non_hypo_scores + current_non_hypo_scores)
+        if 0 < s < HYPO_RULE_THRESHOLD
+    ]
+    if pool:
+        threshold = _quantile_value(pool, percentile_q)
+        threshold = max(ADAPTIVE_NEAR_MIN_FLOOR, min(HYPO_RULE_THRESHOLD - 1, threshold))
+    else:
+        threshold = NEAR_HYPO_MIN_SCORE
+
+    return {
+        "threshold": threshold,
+        "percentile_q": percentile_q,
+        "pool_size": len(pool),
+    }
+
+
 def _dog_key_from_row(row: pd.Series) -> str:
     detail_url = _safe_text(row.get("detail_url", ""))
     if detail_url:
@@ -594,17 +639,29 @@ def load_hypo_state(state_path: str) -> Dict[str, Any]:
     dogs = data.get("dogs", {})
     if not isinstance(dogs, dict):
         dogs = {}
-    return {"dogs": dogs}
+    all_dogs = data.get("all_dogs", {})
+    if not isinstance(all_dogs, dict):
+        all_dogs = {}
+    model = data.get("model", {})
+    if not isinstance(model, dict):
+        model = {}
+    return {
+        "dogs": dogs,
+        "all_dogs": all_dogs,
+        "model": model,
+    }
 
 
-def save_hypo_state(state_path: str, dogs: Dict[str, Dict[str, str]]) -> None:
+def save_hypo_state(state_path: str, state_payload: Dict[str, Any]) -> None:
     state_dir = os.path.dirname(state_path)
     if state_dir:
         os.makedirs(state_dir, exist_ok=True)
 
     payload = {
         "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "dogs": dogs,
+        "dogs": state_payload.get("dogs", {}),
+        "all_dogs": state_payload.get("all_dogs", {}),
+        "model": state_payload.get("model", {}),
     }
     with open(state_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
@@ -615,23 +672,16 @@ def build_hypo_change_sets(
     prior_state: Dict[str, Any],
 ) -> Dict[str, Any]:
     prior_dogs = prior_state.get("dogs", {}) if isinstance(prior_state, dict) else {}
+    prior_all_dogs = prior_state.get("all_dogs", {}) if isinstance(prior_state, dict) else {}
+    prior_model = prior_state.get("model", {}) if isinstance(prior_state, dict) else {}
     prior_keys = set(prior_dogs.keys())
     now_utc = datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-    if "is_hypoallergenic" not in df.columns:
-        hypo_df = pd.DataFrame(columns=df.columns)
+    working_df = df.copy()
+    if not working_df.empty:
+        working_df["dog_key"] = working_df.apply(_dog_key_from_row, axis=1)
     else:
-        hypo_df = df[df["is_hypoallergenic"] == 1].copy()
-
-    if not hypo_df.empty:
-        hypo_df["dog_key"] = hypo_df.apply(_dog_key_from_row, axis=1)
-    else:
-        hypo_df["dog_key"] = pd.Series(dtype=str)
-
-    new_rows: List[Dict[str, str]] = []
-    existing_rows: List[Dict[str, str]] = []
-    current_state_dogs: Dict[str, Dict[str, str]] = {}
-    current_keys = set()
+        working_df["dog_key"] = pd.Series(dtype=str)
 
     tracked_fields = [
         "name",
@@ -647,6 +697,34 @@ def build_hypo_change_sets(
     ]
     diff_fields = ["name", "breed", "location", "gender", "age"]
 
+    def row_to_report(row: pd.Series, status: str, changed_fields: str = "") -> Dict[str, str]:
+        return {
+            "status": status,
+            "changed_fields": changed_fields,
+            "name": _safe_text(row.get("name", "")),
+            "breed": _safe_text(row.get("breed", "")),
+            "location": _safe_text(row.get("location", "")),
+            "gender": _safe_text(row.get("gender", "")),
+            "age": _safe_text(row.get("age", "")),
+            "detail_url": _safe_text(row.get("detail_url", "")),
+            "image_url": _safe_text(row.get("image_url", "")),
+            "hypo_score": _safe_text(row.get("hypo_score", "")),
+            "hypo_confidence": _safe_text(row.get("hypo_confidence", "")),
+            "hypo_reasons": _safe_text(row.get("hypo_reasons", "")),
+            "first_seen": _safe_text(row.get("first_seen", "")),
+            "last_seen": _safe_text(row.get("last_seen", "")),
+        }
+
+    if "is_hypoallergenic" not in working_df.columns:
+        hypo_df = pd.DataFrame(columns=working_df.columns)
+    else:
+        hypo_df = working_df[working_df["is_hypoallergenic"] == 1].copy()
+
+    new_rows: List[Dict[str, str]] = []
+    existing_rows: List[Dict[str, str]] = []
+    current_state_dogs: Dict[str, Dict[str, str]] = {}
+    current_keys = set()
+
     for _, row in hypo_df.iterrows():
         dog_key = _safe_text(row.get("dog_key", ""))
         if not dog_key:
@@ -656,11 +734,11 @@ def build_hypo_change_sets(
         dog_snapshot = {field: _safe_text(row.get(field, "")) for field in tracked_fields}
         prev_snapshot = prior_dogs.get(dog_key, {})
 
-        changed_fields = []
+        changed_fields_list = []
         if prev_snapshot:
             for field in diff_fields:
                 if dog_snapshot[field] != _safe_text(prev_snapshot.get(field, "")):
-                    changed_fields.append(field)
+                    changed_fields_list.append(field)
 
         first_seen = _safe_text(prev_snapshot.get("first_seen", "")) or now_utc
         dog_snapshot["first_seen"] = first_seen
@@ -668,8 +746,8 @@ def build_hypo_change_sets(
         current_state_dogs[dog_key] = dog_snapshot
 
         report_row = {
-            "status": "new" if not prev_snapshot else ("existing_updated" if changed_fields else "existing"),
-            "changed_fields": ", ".join(changed_fields),
+            "status": "new" if not prev_snapshot else ("existing_updated" if changed_fields_list else "existing"),
+            "changed_fields": ", ".join(changed_fields_list),
             **dog_snapshot,
         }
         if report_row["status"] == "new":
@@ -701,35 +779,84 @@ def build_hypo_change_sets(
     existing_rows.sort(key=lambda r: (r["name"].lower(), r["detail_url"].lower()))
     removed_rows.sort(key=lambda r: (r["name"].lower(), r["detail_url"].lower()))
 
+    current_non_hypo_scores = []
+    if "is_hypoallergenic" in working_df.columns and "hypo_score" in working_df.columns:
+        current_non_hypo_scores = [
+            _safe_int(v)
+            for v in working_df.loc[working_df["is_hypoallergenic"] == 0, "hypo_score"].tolist()
+            if 0 <= _safe_int(v) < HYPO_RULE_THRESHOLD
+        ]
+    historical_non_hypo_scores = [
+        _safe_int(v)
+        for v in prior_model.get("score_history", [])
+        if 0 <= _safe_int(v) < HYPO_RULE_THRESHOLD
+    ]
+    adaptive = _compute_adaptive_near_threshold(current_non_hypo_scores, historical_non_hypo_scores)
+    adaptive_threshold = adaptive["threshold"]
+
     near_rows: List[Dict[str, str]] = []
-    if {"is_hypoallergenic", "hypo_score"}.issubset(df.columns):
-        near_df = df[
-            (df["is_hypoallergenic"] == 0)
-            & (df["hypo_score"] >= NEAR_HYPO_MIN_SCORE)
-            & (df["hypo_score"] < HYPO_RULE_THRESHOLD)
+    if {"is_hypoallergenic", "hypo_score", "dog_key"}.issubset(working_df.columns):
+        non_hypo_df = working_df[
+            (working_df["is_hypoallergenic"] == 0)
+            & (working_df["hypo_score"] < HYPO_RULE_THRESHOLD)
         ].copy()
-        if not near_df.empty:
-            near_df = near_df.sort_values(
-                by=["hypo_score", "name"],
-                ascending=[False, True],
-            ).head(NEAR_HYPO_MAX_ITEMS)
-            for _, row in near_df.iterrows():
-                near_rows.append({
-                    "status": "near_hypo",
-                    "changed_fields": "",
-                    "name": _safe_text(row.get("name", "")),
-                    "breed": _safe_text(row.get("breed", "")),
-                    "location": _safe_text(row.get("location", "")),
-                    "gender": _safe_text(row.get("gender", "")),
-                    "age": _safe_text(row.get("age", "")),
-                    "detail_url": _safe_text(row.get("detail_url", "")),
-                    "image_url": _safe_text(row.get("image_url", "")),
-                    "hypo_score": _safe_text(row.get("hypo_score", "")),
-                    "hypo_confidence": _safe_text(row.get("hypo_confidence", "")),
-                    "hypo_reasons": _safe_text(row.get("hypo_reasons", "")),
-                    "first_seen": "",
-                    "last_seen": "",
-                })
+        non_hypo_df = non_hypo_df.sort_values(by=["hypo_score", "name"], ascending=[False, True])
+
+        target_near_count = min(NEAR_HYPO_MAX_ITEMS, ADAPTIVE_TARGET_NEAR_PER_RUN)
+        chosen_df = non_hypo_df[non_hypo_df["hypo_score"] >= adaptive_threshold].head(target_near_count)
+
+        if len(chosen_df) < target_near_count:
+            chosen_keys = set(chosen_df["dog_key"].astype(str).tolist())
+            fallback_df = non_hypo_df[~non_hypo_df["dog_key"].astype(str).isin(chosen_keys)].head(
+                target_near_count - len(chosen_df)
+            )
+            if not fallback_df.empty:
+                fallback_df = fallback_df.copy()
+                fallback_df["near_fallback"] = 1
+                chosen_df = pd.concat([chosen_df, fallback_df], axis=0)
+        if not chosen_df.empty:
+            chosen_df = chosen_df.sort_values(by=["hypo_score", "name"], ascending=[False, True]).head(NEAR_HYPO_MAX_ITEMS)
+            for _, row in chosen_df.iterrows():
+                status = "near_hypo_fallback" if _safe_int(row.get("near_fallback", 0)) == 1 else "near_hypo"
+                near_rows.append(row_to_report(row, status=status))
+
+    all_dogs_state = dict(prior_all_dogs)
+    for _, row in working_df.iterrows():
+        dog_key = _safe_text(row.get("dog_key", ""))
+        if not dog_key:
+            continue
+        prev = prior_all_dogs.get(dog_key, {})
+        seen_count = _safe_int(prev.get("seen_count", 0), 0) + 1
+        current_score = _safe_int(row.get("hypo_score", 0), 0)
+        max_score = max(_safe_int(prev.get("max_score", 0), 0), current_score)
+        first_seen = _safe_text(prev.get("first_seen", "")) or now_utc
+        all_dogs_state[dog_key] = {
+            "name": _safe_text(row.get("name", "")),
+            "breed": _safe_text(row.get("breed", "")),
+            "location": _safe_text(row.get("location", "")),
+            "gender": _safe_text(row.get("gender", "")),
+            "age": _safe_text(row.get("age", "")),
+            "detail_url": _safe_text(row.get("detail_url", "")),
+            "image_url": _safe_text(row.get("image_url", "")),
+            "last_score": str(current_score),
+            "max_score": str(max_score),
+            "last_is_hypo": str(_safe_int(row.get("is_hypoallergenic", 0), 0)),
+            "seen_count": str(seen_count),
+            "first_seen": first_seen,
+            "last_seen": now_utc,
+        }
+
+    model_score_history = historical_non_hypo_scores + current_non_hypo_scores
+    model_score_history = model_score_history[-MODEL_SCORE_HISTORY_MAX:]
+    model_state = {
+        "run_count": _safe_int(prior_model.get("run_count", 0), 0) + 1,
+        "score_history": model_score_history,
+        "adaptive_near_threshold": adaptive_threshold,
+        "adaptive_percentile_q": round(adaptive["percentile_q"], 4),
+        "adaptive_pool_size": adaptive["pool_size"],
+        "adaptive_target_near": ADAPTIVE_TARGET_NEAR_PER_RUN,
+        "last_near_count": len(near_rows),
+    }
 
     return {
         "new_rows": new_rows,
@@ -737,6 +864,14 @@ def build_hypo_change_sets(
         "removed_rows": removed_rows,
         "near_rows": near_rows,
         "current_state_dogs": current_state_dogs,
+        "state_payload": {
+            "dogs": current_state_dogs,
+            "all_dogs": all_dogs_state,
+            "model": model_state,
+        },
+        "adaptive_near_threshold": adaptive_threshold,
+        "adaptive_percentile_q": adaptive["percentile_q"],
+        "adaptive_pool_size": adaptive["pool_size"],
     }
 
 
@@ -748,6 +883,8 @@ def _dog_bullet(row: Dict[str, str], include_change_flag: bool = False) -> str:
         row.get("age", "") or "Unknown age",
     ]
     line = f"- {' | '.join(pieces)}"
+    if row.get("status") == "near_hypo_fallback":
+        line += " [fallback-top-score]"
     score = _safe_text(row.get("hypo_score", ""))
     confidence = _safe_text(row.get("hypo_confidence", ""))
     if score:
@@ -772,6 +909,9 @@ def build_hypo_email_body(
     existing_rows: List[Dict[str, str]],
     removed_rows: List[Dict[str, str]],
     near_rows: List[Dict[str, str]],
+    adaptive_near_threshold: int,
+    adaptive_percentile_q: float,
+    adaptive_pool_size: int,
 ) -> str:
     now_local = datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [
@@ -781,7 +921,15 @@ def build_hypo_email_body(
         f"New hypo candidates: {len(new_rows)}",
         f"Existing hypo candidates: {len(existing_rows)}",
         f"Previously flagged, now no longer listed: {len(removed_rows)}",
-        f"Nearly-hypo candidates: {len(near_rows)} (score {NEAR_HYPO_MIN_SCORE}-{HYPO_RULE_THRESHOLD - 1}, capped at {NEAR_HYPO_MAX_ITEMS})",
+        (
+            "Nearly-hypo candidates: "
+            f"{len(near_rows)} "
+            f"(adaptive threshold >= {adaptive_near_threshold}, "
+            f"target={ADAPTIVE_TARGET_NEAR_PER_RUN}, "
+            f"percentile={adaptive_percentile_q:.2%}, "
+            f"pool={adaptive_pool_size}, "
+            f"cap={NEAR_HYPO_MAX_ITEMS})"
+        ),
         f"Rule threshold: score >= {HYPO_RULE_THRESHOLD}",
         "",
         "=== NEW HYPO DOGS ===",
@@ -803,7 +951,7 @@ def build_hypo_email_body(
     else:
         lines.append("- none")
 
-    lines.extend(["", f"=== NEARLY-HYPO DOGS (score {NEAR_HYPO_MIN_SCORE}-{HYPO_RULE_THRESHOLD - 1}, top {NEAR_HYPO_MAX_ITEMS}) ==="])
+    lines.extend(["", f"=== NEARLY-HYPO DOGS (adaptive threshold >= {adaptive_near_threshold}, top {NEAR_HYPO_MAX_ITEMS}) ==="])
     if near_rows:
         lines.extend(_dog_bullet(row) for row in near_rows)
     else:
@@ -890,13 +1038,19 @@ if __name__ == "__main__":
     existing_rows = change_sets["existing_rows"]
     removed_rows = change_sets["removed_rows"]
     near_rows = change_sets["near_rows"]
+    adaptive_near_threshold = _safe_int(change_sets.get("adaptive_near_threshold", NEAR_HYPO_MIN_SCORE))
+    adaptive_percentile_q = float(change_sets.get("adaptive_percentile_q", 0.0))
+    adaptive_pool_size = _safe_int(change_sets.get("adaptive_pool_size", 0))
 
     logging.info(
-        "hypo summary: new=%s existing=%s no_longer_listed=%s near=%s",
+        "hypo summary: new=%s existing=%s no_longer_listed=%s near=%s adaptive_threshold=%s percentile=%.4f pool=%s",
         len(new_rows),
         len(existing_rows),
         len(removed_rows),
         len(near_rows),
+        adaptive_near_threshold,
+        adaptive_percentile_q,
+        adaptive_pool_size,
     )
 
     timestamp = datetime.now().strftime("%Y.%m.%d_%H.%M")
@@ -915,14 +1069,23 @@ if __name__ == "__main__":
         hypo_df.to_csv(hypo_csv_path, index=False)
         logging.info("saved hypo dataset: %s", hypo_csv_path)
 
-    save_hypo_state(args.state_path, change_sets["current_state_dogs"])
+    save_hypo_state(args.state_path, change_sets["state_payload"])
     logging.info("saved state to %s", args.state_path)
 
     subject_prefix = (
         "MSPCA Hypo Update "
         f"(new: {len(new_rows)}, existing: {len(existing_rows)}, removed: {len(removed_rows)}, near: {len(near_rows)})"
     )
-    email_body = build_hypo_email_body(len(df), new_rows, existing_rows, removed_rows, near_rows)
+    email_body = build_hypo_email_body(
+        len(df),
+        new_rows,
+        existing_rows,
+        removed_rows,
+        near_rows,
+        adaptive_near_threshold,
+        adaptive_percentile_q,
+        adaptive_pool_size,
+    )
     email_sent = send_email_report(
         body=email_body,
         subject_prefix=subject_prefix,

@@ -7,6 +7,7 @@ from detail pages, with cached breed reuse from prior state to reduce requests.
 
 import argparse
 import difflib
+import html
 import json
 import logging
 import os
@@ -1094,30 +1095,94 @@ def build_hypo_change_sets(
     }
 
 
-def _dog_bullet(row: Dict[str, str], include_change_flag: bool = False) -> str:
-    pieces = [
-        row.get("name", "") or "Unknown name",
-        row.get("breed", "") or "Unknown breed",
-        row.get("location", "") or "Unknown location",
-        row.get("age", "") or "Unknown age",
-    ]
-    line = f"- {' | '.join(pieces)}"
-    score = _safe_text(row.get("hypo_score", ""))
-    confidence = _safe_text(row.get("hypo_confidence", ""))
-    if score:
-        if confidence:
-            line += f" [score: {score}, confidence: {confidence}]"
-        else:
-            line += f" [score: {score}]"
+def _truncate(value: str, max_len: int) -> str:
+    text = _safe_text(value)
+    if len(text) <= max_len:
+        return text
+    if max_len <= 1:
+        return text[:max_len]
+    return text[: max_len - 1] + "…"
+
+
+def _row_cells(row: Dict[str, str], include_change_flag: bool = False) -> Dict[str, str]:
+    updated = ""
     if include_change_flag and row.get("changed_fields"):
-        line += f" [UPDATED: {row['changed_fields']}]"
-    reasons = _safe_text(row.get("hypo_reasons", ""))
-    if reasons:
-        line += f"\n  reasons: {reasons}"
-    detail_url = row.get("detail_url", "")
-    if detail_url:
-        line += f"\n  {detail_url}"
-    return line
+        updated = "yes"
+    return {
+        "name": _safe_text(row.get("name", "")) or "Unknown name",
+        "breed": _safe_text(row.get("breed", "")) or "Unknown breed",
+        "location": _safe_text(row.get("location", "")) or "Unknown location",
+        "age": _safe_text(row.get("age", "")) or "Unknown age",
+        "score": _safe_text(row.get("hypo_score", "")),
+        "confidence": _safe_text(row.get("hypo_confidence", "")),
+        "updated": updated,
+        "url": _safe_text(row.get("detail_url", "")),
+    }
+
+
+def _render_text_table(rows: List[Dict[str, str]], include_change_flag: bool = False) -> List[str]:
+    if not rows:
+        return ["(none)"]
+
+    columns = [
+        ("Name", "name", 16),
+        ("Breed", "breed", 24),
+        ("Location", "location", 12),
+        ("Age", "age", 10),
+        ("Score", "score", 5),
+        ("Conf", "confidence", 6),
+        ("Upd", "updated", 3),
+    ]
+    header = " | ".join(title.ljust(width) for title, _, width in columns)
+    divider = "-+-".join("-" * width for _, _, width in columns)
+    lines = [header, divider]
+
+    for row in rows:
+        cells = _row_cells(row, include_change_flag=include_change_flag)
+        line = " | ".join(
+            _truncate(cells[key], width).ljust(width) for _, key, width in columns
+        )
+        lines.append(line)
+        if cells["url"]:
+            lines.append(f"  {cells['url']}")
+    return lines
+
+
+def _render_html_table(rows: List[Dict[str, str]], include_change_flag: bool = False) -> str:
+    if not rows:
+        return "<p><em>None</em></p>"
+
+    header_cells = "".join(
+        f"<th style='text-align:left;padding:8px;border-bottom:1px solid #ddd'>{label}</th>"
+        for label in ("Name", "Breed", "Location", "Age", "Score", "Confidence", "Updated", "Link")
+    )
+
+    body_rows = []
+    for row in rows:
+        cells = _row_cells(row, include_change_flag=include_change_flag)
+        link = ""
+        if cells["url"]:
+            safe_url = html.escape(cells["url"])
+            link = f"<a href='{safe_url}'>View</a>"
+        body_rows.append(
+            "<tr>"
+            f"<td style='padding:8px;border-bottom:1px solid #eee'>{html.escape(cells['name'])}</td>"
+            f"<td style='padding:8px;border-bottom:1px solid #eee'>{html.escape(cells['breed'])}</td>"
+            f"<td style='padding:8px;border-bottom:1px solid #eee'>{html.escape(cells['location'])}</td>"
+            f"<td style='padding:8px;border-bottom:1px solid #eee'>{html.escape(cells['age'])}</td>"
+            f"<td style='padding:8px;border-bottom:1px solid #eee'>{html.escape(cells['score'])}</td>"
+            f"<td style='padding:8px;border-bottom:1px solid #eee'>{html.escape(cells['confidence'])}</td>"
+            f"<td style='padding:8px;border-bottom:1px solid #eee'>{html.escape(cells['updated'])}</td>"
+            f"<td style='padding:8px;border-bottom:1px solid #eee'>{link}</td>"
+            "</tr>"
+        )
+
+    return (
+        "<table style='border-collapse:collapse;width:100%;max-width:1100px;font-family:Arial,sans-serif;font-size:14px'>"
+        f"<thead><tr>{header_cells}</tr></thead>"
+        f"<tbody>{''.join(body_rows)}</tbody>"
+        "</table>"
+    )
 
 
 def build_hypo_email_body(
@@ -1146,36 +1211,57 @@ def build_hypo_email_body(
         "",
         "=== NEW HYPO DOGS ===",
     ]
-    if new_rows:
-        lines.extend(_dog_bullet(row) for row in new_rows)
-    else:
-        lines.append("- none")
+    lines.extend(_render_text_table(new_rows))
 
     lines.extend(["", "=== EXISTING HYPO DOGS (updates flagged) ==="])
-    if existing_rows:
-        lines.extend(_dog_bullet(row, include_change_flag=True) for row in existing_rows)
-    else:
-        lines.append("- none")
+    lines.extend(_render_text_table(existing_rows, include_change_flag=True))
 
     lines.extend(["", "=== PREVIOUSLY FLAGGED, NOW NO LONGER LISTED ==="])
-    if removed_rows:
-        lines.extend(_dog_bullet(row) for row in removed_rows)
-    else:
-        lines.append("- none")
+    lines.extend(_render_text_table(removed_rows))
 
     lines.extend(["", f"=== NEARLY-HYPO DOGS (positive score hit, top {NEAR_HYPO_MAX_ITEMS}) ==="])
-    if near_rows:
-        lines.extend(_dog_bullet(row) for row in near_rows)
-    else:
-        lines.append("- none")
+    lines.extend(_render_text_table(near_rows))
 
     return "\n".join(lines)
+
+
+def build_hypo_email_html(
+    total_dogs: int,
+    new_rows: List[Dict[str, str]],
+    existing_rows: List[Dict[str, str]],
+    removed_rows: List[Dict[str, str]],
+    near_rows: List[Dict[str, str]],
+) -> str:
+    now_local = datetime.now().strftime("%Y-%m-%d %H:%M")
+    return (
+        "<html><body style='font-family:Arial,sans-serif;color:#222'>"
+        f"<h2>MSPCA Hypoallergenic Update ({html.escape(now_local)})</h2>"
+        "<p>"
+        f"Total dogs scraped: <strong>{total_dogs}</strong><br>"
+        f"New hypo candidates: <strong>{len(new_rows)}</strong><br>"
+        f"Existing hypo candidates: <strong>{len(existing_rows)}</strong><br>"
+        f"Previously flagged, now no longer listed: <strong>{len(removed_rows)}</strong><br>"
+        f"Nearly-hypo candidates: <strong>{len(near_rows)}</strong> "
+        f"(positive-score hit only, score 1-{HYPO_RULE_THRESHOLD - 1}, cap={NEAR_HYPO_MAX_ITEMS})<br>"
+        f"Rule threshold: score &gt;= {HYPO_RULE_THRESHOLD}"
+        "</p>"
+        "<h3>New Hypo Dogs</h3>"
+        f"{_render_html_table(new_rows)}"
+        "<h3>Existing Hypo Dogs (updates flagged)</h3>"
+        f"{_render_html_table(existing_rows, include_change_flag=True)}"
+        "<h3>Previously Flagged, Now No Longer Listed</h3>"
+        f"{_render_html_table(removed_rows)}"
+        f"<h3>Nearly-Hypo Dogs (positive score hit, top {NEAR_HYPO_MAX_ITEMS})</h3>"
+        f"{_render_html_table(near_rows)}"
+        "</body></html>"
+    )
 
 
 def send_email_report(
     body: str,
     subject_prefix: str = "MSPCA Hypo Update",
     attachment_path: str = "",
+    html_body: str = "",
 ) -> bool:
     smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
     smtp_port = int(os.environ.get("SMTP_PORT", "587"))
@@ -1194,6 +1280,8 @@ def send_email_report(
     msg["To"] = email_to
     msg["Subject"] = subject
     msg.set_content(body)
+    if html_body:
+        msg.add_alternative(html_body, subtype="html")
 
     if attachment_path and os.path.exists(attachment_path):
         with open(attachment_path, "rb") as f:
@@ -1292,10 +1380,18 @@ if __name__ == "__main__":
         removed_rows,
         near_rows,
     )
+    email_html = build_hypo_email_html(
+        len(df),
+        new_rows,
+        existing_rows,
+        removed_rows,
+        near_rows,
+    )
     email_sent = send_email_report(
         body=email_body,
         subject_prefix=subject_prefix,
         attachment_path=hypo_csv_path,
+        html_body=email_html,
     )
     if email_sent:
         logging.info("email sent")

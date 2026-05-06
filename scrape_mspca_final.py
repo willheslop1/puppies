@@ -1,27 +1,8 @@
 """
-MSPCA Dog Adoption Scraper (listing pages only)
+MSPCA dog scraper + hypoallergenic-focused email report.
 
-What this version adds vs. your original:
-- Parses the structured card DOM instead of regex over visible <a> text
-- Extracts and stores:
-  - detail_url (card link)
-  - image_url (card image)
-  - raw_stats (all petStats key/value pairs found on the card)
-- Still captures name, breed, location, gender, age
-- More resilient to MSPCA changing card text formatting
-
-Output:
-- Email summary focused on hypoallergenic candidates:
-  - new hypo candidates
-  - existing hypo candidates (with updates flagged)
-  - previously flagged hypo candidates no longer listed
-  - nearly-hypo candidates (borderline score band)
-
-Optional output:
-- full-dataset CSV and/or hypo-only CSV via CLI flags
-
-Notes:
-- This intentionally does NOT visit individual dog detail pages.
+Primary path uses MSPCA's AJAX search endpoint and enriches missing breed data
+from detail pages, with cached breed reuse from prior state to reduce requests.
 """
 
 import argparse
@@ -32,10 +13,11 @@ import os
 import re
 import smtplib
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.message import EmailMessage
 from datetime import datetime
 from dataclasses import dataclass, asdict
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from urllib.parse import urljoin
 
 import requests
@@ -48,13 +30,12 @@ DOGS_QUERY = "?type=dog"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; mspca-adoption-scraper/2.0; +https://example.com)"
 }
+MSPCA_AJAX_CONFIG_RE = re.compile(r"var\s+mspca_ajax\s*=\s*(\{.*?\});", re.S)
 
 HYPO_RULE_THRESHOLD = 65
-NEAR_HYPO_MIN_SCORE = 45
 NEAR_HYPO_MAX_ITEMS = 5
-ADAPTIVE_TARGET_NEAR_PER_RUN = 2
-ADAPTIVE_NEAR_MIN_FLOOR = 35
 MODEL_SCORE_HISTORY_MAX = 5000
+DETAIL_FETCH_WORKERS = 8
 HYPO_REGEX_RULES = [
     ("explicit_hypoallergenic", re.compile(r"\bhypoallergenic\b", re.IGNORECASE), 95),
     ("doodle_family", re.compile(r"\b[a-z]*doodle\b", re.IGNORECASE), 72),
@@ -307,9 +288,6 @@ def _score_hypoallergenic_proxy(breed: str) -> Dict[str, Any]:
     }
 
 
-def _is_hypoallergenic_proxy(breed: str) -> int:
-    return _score_hypoallergenic_proxy(breed)["is_candidate"]
-
 def _clean(s: str) -> str:
     return " ".join((s or "").split()).strip()
 
@@ -374,6 +352,160 @@ def fetch(url: str, max_retries: int = 3, backoff_s: float = 1.0) -> str:
                 logging.error("fetch failed (attempt %s/%s): %s", attempt, max_retries, exc)
                 raise
     raise last_exc
+
+
+def fetch_json_post(url: str, data: Dict[str, Any], max_retries: int = 3, backoff_s: float = 1.0) -> Dict[str, Any]:
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(url, headers=HEADERS, data=data, timeout=30)
+            if resp.status_code in (429, 500, 502, 503, 504):
+                raise requests.HTTPError(
+                    f"HTTP {resp.status_code} on POST {url}", response=resp
+                )
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.RequestException, ValueError) as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                sleep_for = backoff_s * (2 ** (attempt - 1))
+                logging.warning(
+                    "post failed (attempt %s/%s): %s; retrying in %.1fs",
+                    attempt,
+                    max_retries,
+                    exc,
+                    sleep_for,
+                )
+                time.sleep(sleep_for)
+            else:
+                logging.error("post failed (attempt %s/%s): %s", attempt, max_retries, exc)
+                raise
+    raise last_exc
+
+
+def get_mspca_ajax_config(max_retries: int = 3, backoff_s: float = 1.0) -> Dict[str, str]:
+    html = fetch(BASE, max_retries=max_retries, backoff_s=backoff_s)
+    match = MSPCA_AJAX_CONFIG_RE.search(html)
+    if not match:
+        raise RuntimeError("mspca_ajax config not found in adoption-search HTML")
+    cfg = json.loads(match.group(1))
+    ajax_url = _clean(cfg.get("ajax_url", ""))
+    nonce = _clean(cfg.get("nonce", ""))
+    if not ajax_url or not nonce:
+        raise RuntimeError("mspca_ajax config missing ajax_url/nonce")
+    return {"ajax_url": ajax_url, "nonce": nonce}
+
+
+def _extract_background_image_url(style_value: str) -> str:
+    style = style_value or ""
+    match = re.search(r"url\((['\"]?)(.*?)\1\)", style, re.IGNORECASE)
+    if not match:
+        return ""
+    return _clean(match.group(2))
+
+
+def parse_dogs_from_ajax_html(html_fragment: str, page_url: str, debug: bool = False) -> List[Dog]:
+    soup = BeautifulSoup(html_fragment or "", "html.parser")
+    dogs: List[Dog] = []
+    cards = soup.select("div.mspca-pet-card")
+
+    for card in cards:
+        link_el = card.select_one("a.mspca-pet-card-link[href]")
+        if not link_el:
+            continue
+        detail_url = urljoin(page_url, link_el.get("href", ""))
+
+        image_div = card.select_one("div.mspca-pet-card-image")
+        image_url = ""
+        if image_div:
+            image_url = _extract_background_image_url(image_div.get("style", ""))
+            image_url = urljoin(page_url, image_url) if image_url else ""
+
+        name_el = card.select_one(".mspca-pet-name")
+        loc_el = card.select_one(".mspca-pet-location")
+        age_el = card.select_one(".mspca-pet-age")
+        name = _clean(name_el.get_text() if name_el else "")
+        location = _clean(loc_el.get_text() if loc_el else "")
+        age = _clean(age_el.get_text() if age_el else "")
+
+        if not detail_url or not location:
+            continue
+
+        stats = {"location": location, "age": age}
+        dogs.append(Dog(
+            name=name,
+            breed="",
+            location=location,
+            gender="",
+            age=age,
+            source_url=page_url,
+            detail_url=detail_url,
+            image_url=image_url,
+            raw_stats=stats,
+        ))
+
+    if debug:
+        logging.debug("ajax cards parsed=%s", len(dogs))
+    return dogs
+
+
+def enrich_dog_from_detail(dog: Dog, max_retries: int = 3, backoff_s: float = 1.0) -> Dog:
+    if dog.breed:
+        return dog
+    if not dog.detail_url:
+        return dog
+    try:
+        html = fetch(dog.detail_url, max_retries=max_retries, backoff_s=backoff_s)
+    except Exception:
+        return dog
+    soup = BeautifulSoup(html, "html.parser")
+    breed_el = soup.select_one(".mspca-pet-breed")
+    if breed_el:
+        dog.breed = _clean(breed_el.get_text())
+    return dog
+
+
+def enrich_missing_breeds(
+    dogs: List[Dog],
+    max_retries: int = 3,
+    backoff_s: float = 1.0,
+    max_workers: int = DETAIL_FETCH_WORKERS,
+) -> None:
+    missing = [dog for dog in dogs if dog.detail_url and not dog.breed]
+    if not missing:
+        return
+
+    workers = max(1, min(max_workers, len(missing)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_dog = {
+            executor.submit(enrich_dog_from_detail, dog, max_retries, backoff_s): dog
+            for dog in missing
+        }
+        for future in as_completed(future_to_dog):
+            try:
+                future.result()
+            except Exception as exc:
+                dog = future_to_dog[future]
+                logging.debug("detail enrichment failed for %s: %s", dog.detail_url, exc)
+
+
+def build_breed_cache(prior_state: Dict[str, Any]) -> Dict[str, str]:
+    cache: Dict[str, str] = {}
+    if not isinstance(prior_state, dict):
+        return cache
+
+    for section in ("dogs", "all_dogs"):
+        state_map = prior_state.get(section, {})
+        if not isinstance(state_map, dict):
+            continue
+        for _, snapshot in state_map.items():
+            if not isinstance(snapshot, dict):
+                continue
+            detail_url = _safe_text(snapshot.get("detail_url", ""))
+            breed = _safe_text(snapshot.get("breed", ""))
+            if detail_url and breed:
+                cache[detail_url] = breed
+    return cache
 
 
 def parse_dogs_from_page(html: str, page_url: str, debug: bool = False) -> List[Dog]:
@@ -484,7 +616,7 @@ def page_url(page: int) -> str:
     return f"{BASE}page/{page}/{DOGS_QUERY}"
 
 
-def scrape_all_dogs(
+def _scrape_all_dogs_legacy(
     max_pages: int = 50,
     sleep_s: float = 1.0,
     debug: bool = False,
@@ -492,14 +624,13 @@ def scrape_all_dogs(
     show_progress: bool = True,
     max_retries: int = 3,
     backoff_s: float = 1.0,
-) -> pd.DataFrame:
+) -> List[Dog]:
     all_dogs: List[Dog] = []
     seen_urls = set()
     zero_new_pages = 0
 
     for p in range(1, max_pages + 1):
         url = page_url(p)
-
         try:
             html = fetch(url, max_retries=max_retries, backoff_s=backoff_s)
         except requests.HTTPError as exc:
@@ -516,12 +647,11 @@ def scrape_all_dogs(
         }
         if debug:
             logging.debug(
-                "page=%s new_urls=%s total_seen=%s", p, len(new_urls), len(seen_urls)
+                "legacy page=%s new_urls=%s total_seen=%s", p, len(new_urls), len(seen_urls)
             )
         if show_progress:
             _progress(p, max_pages)
 
-        # stop when pagination runs out / no cards found
         if p > 1 and len(dogs) == 0:
             break
         if p > 1 and len(new_urls) == 0:
@@ -534,6 +664,110 @@ def scrape_all_dogs(
         seen_urls.update(new_urls)
         all_dogs.extend(dogs)
         time.sleep(sleep_s)
+
+    return all_dogs
+
+
+def scrape_all_dogs(
+    max_pages: int = 50,
+    sleep_s: float = 1.0,
+    debug: bool = False,
+    max_zero_new_pages: int = 3,
+    show_progress: bool = True,
+    max_retries: int = 3,
+    backoff_s: float = 1.0,
+    breed_cache: Optional[Dict[str, str]] = None,
+) -> pd.DataFrame:
+    all_dogs: List[Dog] = []
+    seen_urls = set()
+    zero_new_pages = 0
+
+    try:
+        cfg = get_mspca_ajax_config(max_retries=max_retries, backoff_s=backoff_s)
+        random_seed = int(time.time())
+        ajax_max_pages = max_pages
+
+        for p in range(1, max_pages + 1):
+            payload = {
+                "action": "mspca_filter_pets",
+                "nonce": cfg["nonce"],
+                "animal": "dog",
+                "breed": "",
+                "location": "",
+                "sex": "",
+                "age": "",
+                "paged": p,
+                "random_seed": random_seed,
+            }
+            ajax_resp = fetch_json_post(
+                cfg["ajax_url"],
+                payload,
+                max_retries=max_retries,
+                backoff_s=backoff_s,
+            )
+            if not ajax_resp.get("success"):
+                break
+            data = ajax_resp.get("data", {}) or {}
+            ajax_max_pages = max(1, _safe_int(data.get("max_pages", ajax_max_pages), ajax_max_pages))
+            html_fragment = data.get("html", "")
+            dogs = parse_dogs_from_ajax_html(html_fragment, BASE, debug=debug)
+            if breed_cache:
+                for dog in dogs:
+                    cached_breed = breed_cache.get(dog.detail_url, "")
+                    if cached_breed:
+                        dog.breed = cached_breed
+
+            enrich_missing_breeds(
+                dogs,
+                max_retries=max_retries,
+                backoff_s=backoff_s,
+            )
+            if breed_cache is not None:
+                for dog in dogs:
+                    if dog.detail_url and dog.breed:
+                        breed_cache[dog.detail_url] = dog.breed
+
+            new_urls = {
+                d.detail_url
+                for d in dogs
+                if d.detail_url and d.detail_url not in seen_urls
+            }
+            if debug:
+                logging.debug(
+                    "ajax page=%s new_urls=%s total_seen=%s ajax_max_pages=%s",
+                    p,
+                    len(new_urls),
+                    len(seen_urls),
+                    ajax_max_pages,
+                )
+            if show_progress:
+                _progress(min(p, max_pages), max_pages)
+
+            if p > 1 and len(dogs) == 0:
+                break
+            if p > 1 and len(new_urls) == 0:
+                zero_new_pages += 1
+                if zero_new_pages >= max_zero_new_pages:
+                    break
+            else:
+                zero_new_pages = 0
+
+            seen_urls.update(new_urls)
+            all_dogs.extend(dogs)
+            if p >= ajax_max_pages:
+                break
+            time.sleep(sleep_s)
+    except Exception as exc:
+        logging.warning("ajax scrape failed, falling back to legacy parser: %s", exc)
+        all_dogs = _scrape_all_dogs_legacy(
+            max_pages=max_pages,
+            sleep_s=sleep_s,
+            debug=debug,
+            max_zero_new_pages=max_zero_new_pages,
+            show_progress=show_progress,
+            max_retries=max_retries,
+            backoff_s=backoff_s,
+        )
 
     # Flatten dataclasses into rows
     df = (
@@ -576,41 +810,6 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
-
-
-def _quantile_value(values: List[int], q: float) -> int:
-    if not values:
-        return 0
-    ordered = sorted(values)
-    q = max(0.0, min(1.0, q))
-    idx = int(round((len(ordered) - 1) * q))
-    return ordered[idx]
-
-
-def _compute_adaptive_near_threshold(
-    current_non_hypo_scores: List[int],
-    historical_non_hypo_scores: List[int],
-) -> Dict[str, Any]:
-    # Target percentile based on current run size: aim for ~N candidates each run.
-    denom = max(len(current_non_hypo_scores), 1)
-    percentile_q = max(0.0, min(1.0, 1.0 - (ADAPTIVE_TARGET_NEAR_PER_RUN / denom)))
-
-    pool = [
-        s
-        for s in (historical_non_hypo_scores + current_non_hypo_scores)
-        if 0 < s < HYPO_RULE_THRESHOLD
-    ]
-    if pool:
-        threshold = _quantile_value(pool, percentile_q)
-        threshold = max(ADAPTIVE_NEAR_MIN_FLOOR, min(HYPO_RULE_THRESHOLD - 1, threshold))
-    else:
-        threshold = NEAR_HYPO_MIN_SCORE
-
-    return {
-        "threshold": threshold,
-        "percentile_q": percentile_q,
-        "pool_size": len(pool),
-    }
 
 
 def _prune_score_by_dog(
@@ -821,11 +1020,6 @@ def build_hypo_change_sets(
             if 0 < s < HYPO_RULE_THRESHOLD:
                 historical_non_hypo_score_by_dog[f"legacy_{idx}"] = s
 
-    current_non_hypo_scores = list(current_non_hypo_score_by_dog.values())
-    historical_non_hypo_scores = list(historical_non_hypo_score_by_dog.values())
-    adaptive = _compute_adaptive_near_threshold(current_non_hypo_scores, historical_non_hypo_scores)
-    adaptive_threshold = adaptive["threshold"]
-
     near_rows: List[Dict[str, str]] = []
     if {"is_hypoallergenic", "hypo_score", "dog_key"}.issubset(working_df.columns):
         non_hypo_df = working_df[
@@ -834,24 +1028,11 @@ def build_hypo_change_sets(
             & (working_df["hypo_score"] < HYPO_RULE_THRESHOLD)
         ].copy()
         non_hypo_df = non_hypo_df.sort_values(by=["hypo_score", "name"], ascending=[False, True])
-
-        target_near_count = min(NEAR_HYPO_MAX_ITEMS, ADAPTIVE_TARGET_NEAR_PER_RUN)
-        chosen_df = non_hypo_df[non_hypo_df["hypo_score"] >= adaptive_threshold].head(target_near_count)
-
-        if len(chosen_df) < target_near_count:
-            chosen_keys = set(chosen_df["dog_key"].astype(str).tolist())
-            fallback_df = non_hypo_df[~non_hypo_df["dog_key"].astype(str).isin(chosen_keys)].head(
-                target_near_count - len(chosen_df)
-            )
-            if not fallback_df.empty:
-                fallback_df = fallback_df.copy()
-                fallback_df["near_fallback"] = 1
-                chosen_df = pd.concat([chosen_df, fallback_df], axis=0)
+        chosen_df = non_hypo_df.head(NEAR_HYPO_MAX_ITEMS)
         if not chosen_df.empty:
             chosen_df = chosen_df.sort_values(by=["hypo_score", "name"], ascending=[False, True]).head(NEAR_HYPO_MAX_ITEMS)
             for _, row in chosen_df.iterrows():
-                status = "near_hypo_fallback" if _safe_int(row.get("near_fallback", 0)) == 1 else "near_hypo"
-                near_rows.append(row_to_report(row, status=status))
+                near_rows.append(row_to_report(row, status="near_hypo"))
 
     all_dogs_state = dict(prior_all_dogs)
     for _, row in working_df.iterrows():
@@ -896,10 +1077,6 @@ def build_hypo_change_sets(
         "score_by_dog": merged_score_by_dog,
         "score_history": model_score_history,
         "unique_dogs_in_model": len(merged_score_by_dog),
-        "adaptive_near_threshold": adaptive_threshold,
-        "adaptive_percentile_q": round(adaptive["percentile_q"], 4),
-        "adaptive_pool_size": adaptive["pool_size"],
-        "adaptive_target_near": ADAPTIVE_TARGET_NEAR_PER_RUN,
         "last_near_count": len(near_rows),
     }
 
@@ -914,9 +1091,6 @@ def build_hypo_change_sets(
             "all_dogs": all_dogs_state,
             "model": model_state,
         },
-        "adaptive_near_threshold": adaptive_threshold,
-        "adaptive_percentile_q": adaptive["percentile_q"],
-        "adaptive_pool_size": adaptive["pool_size"],
     }
 
 
@@ -928,8 +1102,6 @@ def _dog_bullet(row: Dict[str, str], include_change_flag: bool = False) -> str:
         row.get("age", "") or "Unknown age",
     ]
     line = f"- {' | '.join(pieces)}"
-    if row.get("status") == "near_hypo_fallback":
-        line += " [fallback-top-score]"
     score = _safe_text(row.get("hypo_score", ""))
     confidence = _safe_text(row.get("hypo_confidence", ""))
     if score:
@@ -954,9 +1126,6 @@ def build_hypo_email_body(
     existing_rows: List[Dict[str, str]],
     removed_rows: List[Dict[str, str]],
     near_rows: List[Dict[str, str]],
-    adaptive_near_threshold: int,
-    adaptive_percentile_q: float,
-    adaptive_pool_size: int,
 ) -> str:
     now_local = datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [
@@ -969,10 +1138,8 @@ def build_hypo_email_body(
         (
             "Nearly-hypo candidates: "
             f"{len(near_rows)} "
-            f"(adaptive threshold >= {adaptive_near_threshold}, "
-            f"target={ADAPTIVE_TARGET_NEAR_PER_RUN}, "
-            f"percentile={adaptive_percentile_q:.2%}, "
-            f"pool={adaptive_pool_size}, "
+            f"(positive-score hit only; "
+            f"score range 1-{HYPO_RULE_THRESHOLD - 1}, "
             f"cap={NEAR_HYPO_MAX_ITEMS})"
         ),
         f"Rule threshold: score >= {HYPO_RULE_THRESHOLD}",
@@ -996,7 +1163,7 @@ def build_hypo_email_body(
     else:
         lines.append("- none")
 
-    lines.extend(["", f"=== NEARLY-HYPO DOGS (adaptive threshold >= {adaptive_near_threshold}, top {NEAR_HYPO_MAX_ITEMS}) ==="])
+    lines.extend(["", f"=== NEARLY-HYPO DOGS (positive score hit, top {NEAR_HYPO_MAX_ITEMS}) ==="])
     if near_rows:
         lines.extend(_dog_bullet(row) for row in near_rows)
     else:
@@ -1066,6 +1233,9 @@ if __name__ == "__main__":
 
     _setup_logging(args.log_path, verbose=args.debug)
 
+    prior_state = load_hypo_state(args.state_path)
+    breed_cache = build_breed_cache(prior_state)
+
     df = scrape_all_dogs(
         max_pages=args.max_pages,
         sleep_s=args.sleep_s,
@@ -1074,28 +1244,22 @@ if __name__ == "__main__":
         max_zero_new_pages=args.max_zero_new_pages,
         max_retries=args.max_retries,
         backoff_s=args.backoff_s,
+        breed_cache=breed_cache,
     )
     logging.info("scraped %s dogs", len(df))
 
-    prior_state = load_hypo_state(args.state_path)
     change_sets = build_hypo_change_sets(df, prior_state)
     new_rows = change_sets["new_rows"]
     existing_rows = change_sets["existing_rows"]
     removed_rows = change_sets["removed_rows"]
     near_rows = change_sets["near_rows"]
-    adaptive_near_threshold = _safe_int(change_sets.get("adaptive_near_threshold", NEAR_HYPO_MIN_SCORE))
-    adaptive_percentile_q = float(change_sets.get("adaptive_percentile_q", 0.0))
-    adaptive_pool_size = _safe_int(change_sets.get("adaptive_pool_size", 0))
 
     logging.info(
-        "hypo summary: new=%s existing=%s no_longer_listed=%s near=%s adaptive_threshold=%s percentile=%.4f pool=%s",
+        "hypo summary: new=%s existing=%s no_longer_listed=%s near=%s",
         len(new_rows),
         len(existing_rows),
         len(removed_rows),
         len(near_rows),
-        adaptive_near_threshold,
-        adaptive_percentile_q,
-        adaptive_pool_size,
     )
 
     timestamp = datetime.now().strftime("%Y.%m.%d_%H.%M")
@@ -1127,9 +1291,6 @@ if __name__ == "__main__":
         existing_rows,
         removed_rows,
         near_rows,
-        adaptive_near_threshold,
-        adaptive_percentile_q,
-        adaptive_pool_size,
     )
     email_sent = send_email_report(
         body=email_body,

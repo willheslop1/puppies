@@ -450,8 +450,42 @@ def parse_dogs_from_ajax_html(html_fragment: str, page_url: str, debug: bool = F
     return dogs
 
 
+def _normalize_gender_value(text: str) -> str:
+    cleaned = _clean(text).lower()
+    if re.search(r"\bfemale\b", cleaned):
+        return "Female"
+    if re.search(r"\bmale\b", cleaned):
+        return "Male"
+    return ""
+
+
+def _extract_gender_from_detail_soup(soup: BeautifulSoup) -> str:
+    # Prefer structured fields if present.
+    for selector in [
+        ".mspca-pet-gender",
+        ".mspca-pet-sex",
+        "[class*='gender']",
+        "[class*='sex']",
+    ]:
+        for el in soup.select(selector):
+            gender = _normalize_gender_value(el.get_text(" ", strip=True))
+            if gender:
+                return gender
+
+    # Fallback: match label/value text from the rendered page.
+    text = soup.get_text(" ", strip=True)
+    match = re.search(
+        r"\b(?:sex|gender)\s*[:\-]?\s*(spayed\s+)?(neutered\s+)?(male|female)\b",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        return _normalize_gender_value(match.group(0))
+    return ""
+
+
 def enrich_dog_from_detail(dog: Dog, max_retries: int = 3, backoff_s: float = 1.0) -> Dog:
-    if dog.breed:
+    if dog.breed and dog.gender:
         return dog
     if not dog.detail_url:
         return dog
@@ -463,6 +497,10 @@ def enrich_dog_from_detail(dog: Dog, max_retries: int = 3, backoff_s: float = 1.
     breed_el = soup.select_one(".mspca-pet-breed")
     if breed_el:
         dog.breed = _clean(breed_el.get_text())
+    if not dog.gender:
+        dog.gender = _extract_gender_from_detail_soup(soup)
+        if dog.gender:
+            dog.raw_stats["gender"] = dog.gender
     return dog
 
 
@@ -472,7 +510,7 @@ def enrich_missing_breeds(
     backoff_s: float = 1.0,
     max_workers: int = DETAIL_FETCH_WORKERS,
 ) -> None:
-    missing = [dog for dog in dogs if dog.detail_url and not dog.breed]
+    missing = [dog for dog in dogs if dog.detail_url and (not dog.breed or not dog.gender)]
     if not missing:
         return
 
@@ -490,8 +528,8 @@ def enrich_missing_breeds(
                 logging.debug("detail enrichment failed for %s: %s", dog.detail_url, exc)
 
 
-def build_breed_cache(prior_state: Dict[str, Any]) -> Dict[str, str]:
-    cache: Dict[str, str] = {}
+def build_detail_cache(prior_state: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
+    cache: Dict[str, Dict[str, str]] = {}
     if not isinstance(prior_state, dict):
         return cache
 
@@ -504,8 +542,12 @@ def build_breed_cache(prior_state: Dict[str, Any]) -> Dict[str, str]:
                 continue
             detail_url = _safe_text(snapshot.get("detail_url", ""))
             breed = _safe_text(snapshot.get("breed", ""))
-            if detail_url and breed:
-                cache[detail_url] = breed
+            gender = _safe_text(snapshot.get("gender", ""))
+            if detail_url and (breed or gender):
+                cache[detail_url] = {
+                    "breed": breed,
+                    "gender": gender,
+                }
     return cache
 
 
@@ -677,7 +719,7 @@ def scrape_all_dogs(
     show_progress: bool = True,
     max_retries: int = 3,
     backoff_s: float = 1.0,
-    breed_cache: Optional[Dict[str, str]] = None,
+    detail_cache: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> pd.DataFrame:
     all_dogs: List[Dog] = []
     seen_urls = set()
@@ -712,21 +754,27 @@ def scrape_all_dogs(
             ajax_max_pages = max(1, _safe_int(data.get("max_pages", ajax_max_pages), ajax_max_pages))
             html_fragment = data.get("html", "")
             dogs = parse_dogs_from_ajax_html(html_fragment, BASE, debug=debug)
-            if breed_cache:
+            if detail_cache:
                 for dog in dogs:
-                    cached_breed = breed_cache.get(dog.detail_url, "")
-                    if cached_breed:
-                        dog.breed = cached_breed
+                    cached = detail_cache.get(dog.detail_url, {})
+                    if cached.get("breed"):
+                        dog.breed = cached["breed"]
+                    if cached.get("gender"):
+                        dog.gender = cached["gender"]
+                        dog.raw_stats["gender"] = dog.gender
 
             enrich_missing_breeds(
                 dogs,
                 max_retries=max_retries,
                 backoff_s=backoff_s,
             )
-            if breed_cache is not None:
+            if detail_cache is not None:
                 for dog in dogs:
-                    if dog.detail_url and dog.breed:
-                        breed_cache[dog.detail_url] = dog.breed
+                    if dog.detail_url and (dog.breed or dog.gender):
+                        detail_cache[dog.detail_url] = {
+                            "breed": dog.breed,
+                            "gender": dog.gender,
+                        }
 
             new_urls = {
                 d.detail_url
@@ -1325,7 +1373,7 @@ if __name__ == "__main__":
     _setup_logging(args.log_path, verbose=args.debug)
 
     prior_state = load_hypo_state(args.state_path)
-    breed_cache = build_breed_cache(prior_state)
+    detail_cache = build_detail_cache(prior_state)
 
     df = scrape_all_dogs(
         max_pages=args.max_pages,
@@ -1335,7 +1383,7 @@ if __name__ == "__main__":
         max_zero_new_pages=args.max_zero_new_pages,
         max_retries=args.max_retries,
         backoff_s=args.backoff_s,
-        breed_cache=breed_cache,
+        detail_cache=detail_cache,
     )
     logging.info("scraped %s dogs", len(df))
 

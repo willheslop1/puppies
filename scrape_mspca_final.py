@@ -1238,6 +1238,8 @@ def _render_html_table(rows: List[Dict[str, str]], include_change_flag: bool = F
 
 def build_hypo_email_body(
     total_dogs: int,
+    breed_coverage_pct: float,
+    breed_coverage_count: int,
     new_rows: List[Dict[str, str]],
     existing_rows: List[Dict[str, str]],
     removed_rows: List[Dict[str, str]],
@@ -1246,6 +1248,12 @@ def build_hypo_email_body(
     now_local = datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [
         f"MSPCA hypoallergenic update ({now_local})",
+        "",
+        (
+            "!!! BREED COVERAGE: "
+            f"{breed_coverage_pct:.1f}% "
+            f"({breed_coverage_count}/{total_dogs}) !!!"
+        ),
         "",
         f"Total dogs scraped: {total_dogs}",
         f"New hypo candidates: {len(new_rows)}",
@@ -1278,6 +1286,8 @@ def build_hypo_email_body(
 
 def build_hypo_email_html(
     total_dogs: int,
+    breed_coverage_pct: float,
+    breed_coverage_count: int,
     new_rows: List[Dict[str, str]],
     existing_rows: List[Dict[str, str]],
     removed_rows: List[Dict[str, str]],
@@ -1287,6 +1297,9 @@ def build_hypo_email_html(
     return (
         "<html><body style='font-family:Arial,sans-serif;color:#222'>"
         f"<h2>MSPCA Hypoallergenic Update ({html.escape(now_local)})</h2>"
+        f"<p style='color:#b00020;font-weight:700;font-size:17px;margin:8px 0 14px 0'>"
+        f"BREED COVERAGE: {breed_coverage_pct:.1f}% ({breed_coverage_count}/{total_dogs})"
+        "</p>"
         "<p>"
         f"Total dogs scraped: <strong>{total_dogs}</strong><br>"
         f"New hypo candidates: <strong>{len(new_rows)}</strong><br>"
@@ -1386,6 +1399,11 @@ if __name__ == "__main__":
         detail_cache=detail_cache,
     )
     logging.info("scraped %s dogs", len(df))
+    total_dogs = len(df)
+    breed_coverage_count = 0
+    if "breed" in df.columns and total_dogs > 0:
+        breed_coverage_count = int(df["breed"].fillna("").astype(str).str.strip().ne("").sum())
+    breed_coverage_pct = (100.0 * breed_coverage_count / total_dogs) if total_dogs else 0.0
 
     change_sets = build_hypo_change_sets(df, prior_state)
     new_rows = change_sets["new_rows"]
@@ -1425,14 +1443,18 @@ if __name__ == "__main__":
         f"(new: {len(new_rows)}, existing: {len(existing_rows)}, removed: {len(removed_rows)}, near: {len(near_rows)})"
     )
     email_body = build_hypo_email_body(
-        len(df),
+        total_dogs,
+        breed_coverage_pct,
+        breed_coverage_count,
         new_rows,
         existing_rows,
         removed_rows,
         near_rows,
     )
     email_html = build_hypo_email_html(
-        len(df),
+        total_dogs,
+        breed_coverage_pct,
+        breed_coverage_count,
         new_rows,
         existing_rows,
         removed_rows,
